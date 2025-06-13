@@ -1,0 +1,536 @@
+"""
+Packet Buddy Backend API
+========================
+FastAPI service for interactive PCAP analysis with anomaly detection and AI chat capabilities.
+"""
+import asyncio
+import logging
+import os
+import tempfile
+import uuid
+from datetime import datetime
+from pathlib import Path
+from typing import Dict, List, Optional, Any
+import json
+
+from fastapi import FastAPI, File, UploadFile, HTTPException, BackgroundTasks, Depends
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel, Field
+import uvicorn
+
+# Internal modules (to be implemented separately)
+from utils.parser import PCAPParser
+from utils.summarizer import TrafficSummarizer
+from utils.anomalies import AnomalyDetector
+from utils.chatbot import PacketChatbot
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
+
+# Pydantic models for request/response
+class AnalysisStatus(BaseModel):
+    """Status of PCAP analysis task"""
+    task_id: str
+    status: str = Field(..., description="pending, processing, completed, failed")
+    message: Optional[str] = None
+    created_at: datetime
+    completed_at: Optional[datetime] = None
+
+class TrafficSummary(BaseModel):
+    """Summary of network traffic analysis"""
+    total_packets: int
+    total_bytes: int
+    duration_seconds: float
+    unique_src_ips: int
+    unique_dst_ips: int
+    protocols: Dict[str, int]
+    top_talkers: List[Dict[str, Any]]
+    port_analysis: Dict[str, Any]
+    timeline: List[Dict[str, Any]]
+
+class AnomalyReport(BaseModel):
+    """Anomaly detection results"""
+    total_anomalies: int
+    anomaly_types: Dict[str, int]
+    high_severity: List[Dict[str, Any]]
+    medium_severity: List[Dict[str, Any]]
+    low_severity: List[Dict[str, Any]]
+    recommendations: List[str]
+
+class ChatRequest(BaseModel):
+    """Chat request with context"""
+    message: str
+    task_id: Optional[str] = None
+    context: Optional[Dict[str, Any]] = None
+
+class ChatResponse(BaseModel):
+    """Chat response"""
+    response: str
+    context_used: bool
+    suggested_questions: List[str]
+
+class AnalysisResult(BaseModel):
+    """Complete analysis result"""
+    task_id: str
+    status: str
+    summary: Optional[TrafficSummary]
+    anomalies: Optional[AnomalyReport]
+    file_info: Dict[str, Any]
+    processing_time: Optional[float]
+
+# FastAPI app initialization
+app = FastAPI(
+    title="Packet Buddy API",
+    description="Backend service for interactive PCAP analysis",
+    version="1.0.0",
+    docs_url="/docs",
+    redoc_url="/redoc"
+)
+
+# CORS middleware for frontend integration
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # Configure appropriately for production
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# In-memory storage for analysis tasks (use Redis/DB in production)
+analysis_tasks: Dict[str, Dict[str, Any]] = {}
+analysis_results: Dict[str, AnalysisResult] = {}
+
+# Initialize service components
+parser = PCAPParser()
+summarizer = TrafficSummarizer()
+anomaly_detector = AnomalyDetector()
+chatbot = PacketChatbot()
+
+# Utility functions
+def generate_task_id() -> str:
+    """Generate unique task ID"""
+    return str(uuid.uuid4())
+
+def validate_pcap_file(file: UploadFile) -> bool:
+    """Validate uploaded file is a PCAP"""
+    valid_extensions = ['.pcap', '.pcapng', '.cap']
+    file_ext = Path(file.filename).suffix.lower()
+    return file_ext in valid_extensions
+
+async def save_uploaded_file(file: UploadFile) -> str:
+    """Save uploaded file to temporary location"""
+    temp_dir = tempfile.gettempdir()
+    file_path = os.path.join(temp_dir, f"pcap_{generate_task_id()}_{file.filename}")
+    
+    with open(file_path, "wb") as buffer:
+        content = await file.read()
+        buffer.write(content)
+    
+    return file_path
+
+# API Endpoints
+
+@app.get("/")
+async def root():
+    """Health check endpoint"""
+    return {
+        "service": "Packet Buddy API",
+        "status": "healthy",
+        "version": "1.0.0",
+        "timestamp": datetime.now().isoformat()
+    }
+
+@app.get("/health")
+async def health_check():
+    """Detailed health check"""
+    return {
+        "status": "healthy",
+        "services": {
+            "parser": "available",
+            "summarizer": "available", 
+            "anomaly_detector": "available",
+            "chatbot": "available"
+        },
+        "active_tasks": len(analysis_tasks),
+        "completed_analyses": len(analysis_results)
+    }
+
+@app.post("/upload", response_model=AnalysisStatus)
+async def upload_pcap(
+    background_tasks: BackgroundTasks,
+    file: UploadFile = File(...),
+    run_anomaly_detection: bool = True
+):
+    """
+    Upload and initiate PCAP analysis
+    
+    Args:
+        file: PCAP file to analyze
+        run_anomaly_detection: Whether to run anomaly detection
+        
+    Returns:
+        Analysis status with task ID
+    """
+    try:
+        # Validate file
+        if not validate_pcap_file(file):
+            raise HTTPException(
+                status_code=400,
+                detail="Invalid file type. Please upload a .pcap, .pcapng, or .cap file"
+            )
+        
+        # Generate task ID
+        task_id = generate_task_id()
+        
+        # Save file
+        file_path = await save_uploaded_file(file)
+        
+        # Initialize task
+        task_info = {
+            "task_id": task_id,
+            "status": "pending",
+            "file_path": file_path,
+            "filename": file.filename,
+            "file_size": file.size,
+            "run_anomaly_detection": run_anomaly_detection,
+            "created_at": datetime.now(),
+            "message": "PCAP uploaded successfully, analysis queued"
+        }
+        
+        analysis_tasks[task_id] = task_info
+        
+        # Queue background processing
+        background_tasks.add_task(process_pcap_analysis, task_id)
+        
+        logger.info(f"PCAP upload initiated: {task_id} - {file.filename}")
+        
+        return AnalysisStatus(
+            task_id=task_id,
+            status="pending",
+            message="PCAP uploaded successfully, analysis queued",
+            created_at=task_info["created_at"]
+        )
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Upload failed: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Upload failed: {str(e)}")
+
+@app.get("/status/{task_id}", response_model=AnalysisStatus)
+async def get_analysis_status(task_id: str):
+    """
+    Get analysis status for a task
+    
+    Args:
+        task_id: Task identifier
+        
+    Returns:
+        Current analysis status
+    """
+    if task_id not in analysis_tasks:
+        raise HTTPException(status_code=404, detail="Task not found")
+    
+    task = analysis_tasks[task_id]
+    return AnalysisStatus(
+        task_id=task_id,
+        status=task["status"],
+        message=task.get("message"),
+        created_at=task["created_at"],
+        completed_at=task.get("completed_at")
+    )
+
+@app.get("/results/{task_id}", response_model=AnalysisResult)
+async def get_analysis_results(task_id: str):
+    """
+    Get complete analysis results
+    
+    Args:
+        task_id: Task identifier
+        
+    Returns:
+        Complete analysis results
+    """
+    if task_id not in analysis_results:
+        if task_id in analysis_tasks:
+            task = analysis_tasks[task_id]
+            if task["status"] == "processing":
+                raise HTTPException(status_code=202, detail="Analysis still in progress")
+            elif task["status"] == "failed":
+                raise HTTPException(status_code=500, detail=task.get("message", "Analysis failed"))
+        raise HTTPException(status_code=404, detail="Results not found")
+    
+    return analysis_results[task_id]
+
+@app.get("/summary/{task_id}", response_model=TrafficSummary)
+async def get_traffic_summary(task_id: str):
+    """
+    Get traffic summary for completed analysis
+    
+    Args:
+        task_id: Task identifier
+        
+    Returns:
+        Traffic summary
+    """
+    if task_id not in analysis_results:
+        raise HTTPException(status_code=404, detail="Analysis results not found")
+    
+    result = analysis_results[task_id]
+    if not result.summary:
+        raise HTTPException(status_code=404, detail="Summary not available")
+    
+    return result.summary
+
+@app.get("/anomalies/{task_id}", response_model=AnomalyReport)
+async def get_anomaly_report(task_id: str):
+    """
+    Get anomaly detection report
+    
+    Args:
+        task_id: Task identifier
+        
+    Returns:
+        Anomaly detection report
+    """
+    if task_id not in analysis_results:
+        raise HTTPException(status_code=404, detail="Analysis results not found")
+    
+    result = analysis_results[task_id]
+    if not result.anomalies:
+        raise HTTPException(status_code=404, detail="Anomaly report not available")
+    
+    return result.anomalies
+
+@app.post("/chat", response_model=ChatResponse)
+async def chat_with_analysis(request: ChatRequest):
+    """
+    Chat with AI about PCAP analysis
+    
+    Args:
+        request: Chat request with message and optional context
+        
+    Returns:
+        AI response with suggestions
+    """
+    try:
+        # Get analysis context if task_id provided
+        context = request.context or {}
+        
+        if request.task_id and request.task_id in analysis_results:
+            result = analysis_results[request.task_id]
+            context.update({
+                "summary": result.summary.dict() if result.summary else None,
+                "anomalies": result.anomalies.dict() if result.anomalies else None,
+                "file_info": result.file_info
+            })
+        
+        # Get AI response
+        response = await chatbot.generate_response(
+            message=request.message,
+            context=context
+        )
+        
+        return ChatResponse(
+            response=response["response"],
+            context_used=bool(context),
+            suggested_questions=response.get("suggested_questions", [])
+        )
+        
+    except Exception as e:
+        logger.error(f"Chat failed: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Chat failed: {str(e)}")
+
+@app.delete("/analysis/{task_id}")
+async def delete_analysis(task_id: str):
+    """
+    Delete analysis task and results
+    
+    Args:
+        task_id: Task identifier
+        
+    Returns:
+        Deletion confirmation
+    """
+    deleted_items = []
+    
+    # Remove from tasks
+    if task_id in analysis_tasks:
+        task = analysis_tasks[task_id]
+        # Clean up file
+        if "file_path" in task and os.path.exists(task["file_path"]):
+            os.remove(task["file_path"])
+        del analysis_tasks[task_id]
+        deleted_items.append("task")
+    
+    # Remove from results
+    if task_id in analysis_results:
+        del analysis_results[task_id]
+        deleted_items.append("results")
+    
+    if not deleted_items:
+        raise HTTPException(status_code=404, detail="Task not found")
+    
+    return {
+        "message": f"Deleted {', '.join(deleted_items)} for task {task_id}",
+        "task_id": task_id
+    }
+
+@app.get("/analyses")
+async def list_analyses():
+    """
+    List all analysis tasks and their status
+    
+    Returns:
+        List of all analyses
+    """
+    analyses = []
+    
+    for task_id, task in analysis_tasks.items():
+        analysis_info = {
+            "task_id": task_id,
+            "filename": task.get("filename"),
+            "status": task["status"],
+            "created_at": task["created_at"].isoformat(),
+            "file_size": task.get("file_size")
+        }
+        
+        if task_id in analysis_results:
+            result = analysis_results[task_id]
+            analysis_info.update({
+                "has_summary": result.summary is not None,
+                "has_anomalies": result.anomalies is not None,
+                "processing_time": result.processing_time
+            })
+        
+        analyses.append(analysis_info)
+    
+    return {
+        "total_analyses": len(analyses),
+        "analyses": sorted(analyses, key=lambda x: x["created_at"], reverse=True)
+    }
+
+# Background processing function
+async def process_pcap_analysis(task_id: str):
+    """
+    Background task to process PCAP analysis
+    
+    Args:
+        task_id: Task identifier
+    """
+    start_time = datetime.now()
+    
+    try:
+        logger.info(f"Starting analysis for task: {task_id}")
+        
+        # Update status
+        analysis_tasks[task_id]["status"] = "processing"
+        analysis_tasks[task_id]["message"] = "Parsing PCAP file..."
+        
+        task_info = analysis_tasks[task_id]
+        file_path = task_info["file_path"]
+        
+        # Parse PCAP
+        logger.info(f"Parsing PCAP: {file_path}")
+        parsed_data = await parser.parse_pcap(file_path)
+        
+        # Update status
+        analysis_tasks[task_id]["message"] = "Generating traffic summary..."
+        
+        # Generate summary
+        logger.info(f"Generating summary for: {task_id}")
+        summary = await summarizer.generate_summary(parsed_data)
+        
+        # Run anomaly detection if requested
+        anomalies = None
+        if task_info.get("run_anomaly_detection", True):
+            analysis_tasks[task_id]["message"] = "Detecting anomalies..."
+            logger.info(f"Running anomaly detection for: {task_id}")
+            anomalies = await anomaly_detector.detect_anomalies(parsed_data)
+        
+        # Create result
+        processing_time = (datetime.now() - start_time).total_seconds()
+        
+        result = AnalysisResult(
+            task_id=task_id,
+            status="completed",
+            summary=TrafficSummary(**summary),
+            anomalies=AnomalyReport(**anomalies) if anomalies else None,
+            file_info={
+                "filename": task_info["filename"],
+                "file_size": task_info["file_size"],
+                "packets_processed": parsed_data.get("total_packets", 0)
+            },
+            processing_time=processing_time
+        )
+        
+        # Store result
+        analysis_results[task_id] = result
+        
+        # Update task status
+        analysis_tasks[task_id].update({
+            "status": "completed",
+            "message": "Analysis completed successfully",
+            "completed_at": datetime.now()
+        })
+        
+        logger.info(f"Analysis completed for task: {task_id} in {processing_time:.2f}s")
+        
+    except Exception as e:
+        logger.error(f"Analysis failed for task {task_id}: {str(e)}")
+        
+        # Update task with error
+        analysis_tasks[task_id].update({
+            "status": "failed",
+            "message": f"Analysis failed: {str(e)}",
+            "completed_at": datetime.now()
+        })
+        
+        # Clean up file
+        if "file_path" in analysis_tasks[task_id]:
+            file_path = analysis_tasks[task_id]["file_path"]
+            if os.path.exists(file_path):
+                os.remove(file_path)
+
+# Error handlers
+@app.exception_handler(HTTPException)
+async def http_exception_handler(request, exc):
+    """Custom HTTP exception handler"""
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={
+            "error": True,
+            "message": exc.detail,
+            "status_code": exc.status_code,
+            "timestamp": datetime.now().isoformat()
+        }
+    )
+
+@app.exception_handler(Exception)
+async def general_exception_handler(request, exc):
+    """General exception handler"""
+    logger.error(f"Unhandled exception: {str(exc)}")
+    return JSONResponse(
+        status_code=500,
+        content={
+            "error": True,
+            "message": "Internal server error",
+            "status_code": 500,
+            "timestamp": datetime.now().isoformat()
+        }
+    )
+
+# Main execution
+if __name__ == "__main__":
+    uvicorn.run(
+        "main:app",
+        host="0.0.0.0",
+        port=8000,
+        reload=True,
+        log_level="info"
+    )
