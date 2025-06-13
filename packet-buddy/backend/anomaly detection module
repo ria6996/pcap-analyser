@@ -1,0 +1,660 @@
+"""
+utils/anomalies.py
+==================
+Anomaly detection utilities for Packet Buddy
+"""
+
+import asyncio
+import logging
+from datetime import datetime, timedelta
+from typing import Dict, List, Any, Optional, Tuple
+from collections import Counter, defaultdict
+import statistics
+import math
+import ipaddress
+
+logger = logging.getLogger(__name__)
+
+class AnomalyDetector:
+    """Network traffic anomaly detection using statistical and rule-based methods"""
+    
+    def __init__(self):
+        # Known malicious ports and patterns
+        self.suspicious_ports = {
+            1433, 1434,  # SQL Server
+            3389,        # RDP
+            4444, 4445,  # Common backdoor ports
+            6666, 6667,  # IRC/Trojans
+            12345, 12346, # NetBus
+            20034,       # NetBus Pro
+            31337,       # Back Orifice
+            54321,       # Back Orifice 2K
+        }
+        
+        # Common attack patterns
+        self.attack_signatures = {
+            'port_scan': {'threshold': 10, 'timeframe': 60},
+            'syn_flood': {'threshold': 100, 'timeframe': 10},
+            'dns_tunneling': {'threshold': 50, 'avg_size': 100},
+            'data_exfiltration': {'threshold': 1000000, 'timeframe': 60}  # 1MB in 60s
+        }
+        
+        # Protocol anomaly thresholds
+        self.protocol_thresholds = {
+            'packet_size_std_dev_multiplier': 3,
+            'inter_arrival_time_multiplier': 3,
+            'connection_count_threshold': 100
+        }
+        
+        # Private IP ranges for geographic analysis
+        self.private_ranges = [
+            ipaddress.IPv4Network("10.0.0.0/8"),
+            ipaddress.IPv4Network("172.16.0.0/12"),
+            ipaddress.IPv4Network("192.168.0.0/16"),
+            ipaddress.IPv4Network("127.0.0.0/8")
+        ]
+    
+    async def detect_anomalies(self, parsed_data: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Detect network anomalies in parsed PCAP data
+        
+        Args:
+            parsed_data: Output from PCAPParser
+            
+        Returns:
+            Anomaly detection report
+        """
+        try:
+            logger.info("Starting anomaly detection")
+            
+            # Use asyncio to prevent blocking
+            loop = asyncio.get_event_loop()
+            anomalies = await loop.run_in_executor(
+                None, self._detect_anomalies_sync, parsed_data
+            )
+            
+            logger.info(f"Anomaly detection completed - Found {anomalies['total_anomalies']} anomalies")
+            return anomalies
+            
+        except Exception as e:
+            logger.error(f"Anomaly detection failed: {str(e)}")
+            raise
+    
+    def _detect_anomalies_sync(self, parsed_data: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Synchronous anomaly detection
+        
+        Args:
+            parsed_data: Parsed PCAP data
+            
+        Returns:
+            Anomaly detection results
+        """
+        anomalies = {
+            'total_anomalies': 0,
+            'anomaly_types': {},
+            'high_severity': [],
+            'medium_severity': [],
+            'low_severity': [],
+            'recommendations': []
+        }
+        
+        # Run different anomaly detection methods
+        detection_methods = [
+            self._detect_port_scans,
+            self._detect_syn_floods,
+            self._detect_dns_anomalies,
+            self._detect_data_exfiltration,
+            self._detect_suspicious_ports,
+            self._detect_packet_size_anomalies,
+            self._detect_timing_anomalies,
+            self._detect_protocol_anomalies,
+            self._detect_geographic_anomalies,
+            self._detect_frequency_anomalies
+        ]
+        
+        for method in detection_methods:
+            try:
+                method_anomalies = method(parsed_data)
+                self._merge_anomalies(anomalies, method_anomalies)
+            except Exception as e:
+                logger.error(f"Error in detection method {method.__name__}: {str(e)}")
+                continue
+        
+        # Generate recommendations
+        anomalies['recommendations'] = self._generate_recommendations(anomalies)
+        
+        return anomalies
+    
+    def _detect_port_scans(self, parsed_data: Dict[str, Any]) -> Dict[str, Any]:
+        """Detect potential port scanning activities"""
+        anomalies = {'high_severity': [], 'medium_severity': [], 'low_severity': []}
+        
+        # Track unique ports accessed per source IP
+        ip_port_access = defaultdict(set)
+        
+        for packet in parsed_data['packets']:
+            src_ip = packet.get('src_ip')
+            dst_port = packet.get('dst_port')
+            
+            if src_ip and dst_port:
+                ip_port_access[src_ip].add(dst_port)
+        
+        # Identify potential scanners
+        for src_ip, ports in ip_port_access.items():
+            port_count = len(ports)
+            
+            if port_count >= 50:
+                anomalies['high_severity'].append({
+                    'type': 'port_scan',
+                    'severity': 'high',
+                    'source_ip': src_ip,
+                    'ports_scanned': port_count,
+                    'description': f'Potential port scan from {src_ip} - {port_count} unique ports accessed',
+                    'timestamp': datetime.now().isoformat(),
+                    'confidence': min(100, port_count * 2)
+                })
+            elif port_count >= 20:
+                anomalies['medium_severity'].append({
+                    'type': 'port_scan',
+                    'severity': 'medium',
+                    'source_ip': src_ip,
+                    'ports_scanned': port_count,
+                    'description': f'Possible port scan from {src_ip} - {port_count} unique ports accessed',
+                    'timestamp': datetime.now().isoformat(),
+                    'confidence': port_count * 3
+                })
+            elif port_count >= 10:
+                anomalies['low_severity'].append({
+                    'type': 'port_scan',
+                    'severity': 'low',
+                    'source_ip': src_ip,
+                    'ports_scanned': port_count,
+                    'description': f'Potential reconnaissance from {src_ip} - {port_count} unique ports accessed',
+                    'timestamp': datetime.now().isoformat(),
+                    'confidence': port_count * 5
+                })
+        
+        return anomalies
+    
+    def _detect_syn_floods(self, parsed_data: Dict[str, Any]) -> Dict[str, Any]:
+        """Detect potential SYN flood attacks"""
+        anomalies = {'high_severity': [], 'medium_severity': [], 'low_severity': []}
+        
+        # Count SYN packets per source IP
+        syn_counts = defaultdict(int)
+        
+        for packet in parsed_data['packets']:
+            if packet.get('protocol') == 'TCP' and packet.get('flags'):
+                if 'SYN' in packet['flags'] and 'ACK' not in packet['flags']:
+                    src_ip = packet.get('src_ip')
+                    if src_ip:
+                        syn_counts[src_ip] += 1
+        
+        # Identify potential SYN flood sources
+        total_packets = parsed_data.get('total_packets', 1)
+        duration = parsed_data.get('duration', 1)
+        
+        for src_ip, syn_count in syn_counts.items():
+            syn_rate = syn_count / duration if duration > 0 else syn_count
+            syn_percentage = (syn_count / total_packets) * 100
+            
+            if syn_rate > 100:  # > 100 SYN/sec
+                anomalies['high_severity'].append({
+                    'type': 'syn_flood',
+                    'severity': 'high',
+                    'source_ip': src_ip,
+                    'syn_count': syn_count,
+                    'syn_rate': round(syn_rate, 2),
+                    'syn_percentage': round(syn_percentage, 2),
+                    'description': f'Potential SYN flood from {src_ip} - {syn_count} SYN packets ({syn_rate:.1f}/sec)',
+                    'timestamp': datetime.now().isoformat(),
+                    'confidence': min(100, syn_rate)
+                })
+            elif syn_rate > 50:  # > 50 SYN/sec
+                anomalies['medium_severity'].append({
+                    'type': 'syn_flood',
+                    'severity': 'medium',
+                    'source_ip': src_ip,
+                    'syn_count': syn_count,
+                    'syn_rate': round(syn_rate, 2),
+                    'description': f'High SYN rate from {src_ip} - {syn_count} SYN packets ({syn_rate:.1f}/sec)',
+                    'timestamp': datetime.now().isoformat(),
+                    'confidence': syn_rate * 2
+                })
+        
+        return anomalies
+    
+    def _detect_dns_anomalies(self, parsed_data: Dict[str, Any]) -> Dict[str, Any]:
+        """Detect DNS-related anomalies including tunneling"""
+        anomalies = {'high_severity': [], 'medium_severity': [], 'low_severity': []}
+        
+        # Analyze DNS traffic
+        dns_packets = [p for p in parsed_data['packets'] 
+                      if p.get('src_port') == 53 or p.get('dst_port') == 53]
+        
+        if not dns_packets:
+            return anomalies
+        
+        # Check for unusually large DNS packets (potential tunneling)
+        large_dns_packets = [p for p in dns_packets if p.get('length', 0) > 512]
+        
+        if len(large_dns_packets) > 10:
+            anomalies['high_severity'].append({
+                'type': 'dns_tunneling',
+                'severity': 'high',
+                'packet_count': len(large_dns_packets),
+                'description': f'Potential DNS tunneling detected - {len(large_dns_packets)} oversized DNS packets',
+                'timestamp': datetime.now().isoformat(),
+                'confidence': min(100, len(large_dns_packets) * 5)
+            })
+        
+        # Check for excessive DNS queries from single source
+        dns_query_counts = defaultdict(int)
+        for packet in dns_packets:
+            if packet.get('dst_port') == 53:  # Outgoing DNS queries
+                src_ip = packet.get('src_ip')
+                if src_ip:
+                    dns_query_counts[src_ip] += 1
+        
+        for src_ip, query_count in dns_query_counts.items():
+            if query_count > 1000:
+                anomalies['medium_severity'].append({
+                    'type': 'excessive_dns_queries',
+                    'severity': 'medium',
+                    'source_ip': src_ip,
+                    'query_count': query_count,
+                    'description': f'Excessive DNS queries from {src_ip} - {query_count} queries',
+                    'timestamp': datetime.now().isoformat(),
+                    'confidence': min(100, query_count // 10)
+                })
+        
+        return anomalies
+    
+    def _detect_data_exfiltration(self, parsed_data: Dict[str, Any]) -> Dict[str, Any]:
+        """Detect potential data exfiltration patterns"""
+        anomalies = {'high_severity': [], 'medium_severity': [], 'low_severity': []}
+        
+        # Track data volumes per connection
+        connection_data = defaultdict(lambda: {'bytes_out': 0, 'bytes_in': 0, 'packets': 0})
+        
+        # Identify local network ranges
+        local_ips = set()
+        external_ips = set()
+        
+        for packet in parsed_data['packets']:
+            src_ip = packet.get('src_ip')
+            dst_ip = packet.get('dst_ip')
+            length = packet.get('length', 0)
+            
+            if src_ip and dst_ip:
+                # Classify IPs as local or external
+                try:
+                    src_addr = ipaddress.IPv4Address(src_ip)
+                    dst_addr = ipaddress.IPv4Address(dst_ip)
+                    
+                    src_is_private = any(src_addr in net for net in self.private_ranges)
+                    dst_is_private = any(dst_addr in net for net in self.private_ranges)
+                    
+                    if src_is_private:
+                        local_ips.add(src_ip)
+                    else:
+                        external_ips.add(src_ip)
+                        
+                    if dst_is_private:
+                        local_ips.add(dst_ip)
+                    else:
+                        external_ips.add(dst_ip)
+                    
+                    # Track outbound traffic from local to external
+                    if src_is_private and not dst_is_private:
+                        connection_key = f"{src_ip}->{dst_ip}"
+                        connection_data[connection_key]['bytes_out'] += length
+                        connection_data[connection_key]['packets'] += 1
+                        
+                except ipaddress.AddressValueError:
+                    continue
+        
+        # Identify suspicious outbound data volumes
+        for connection, data in connection_data.items():
+            bytes_out = data['bytes_out']
+            packet_count = data['packets']
+            
+            # Large data transfers (> 100MB)
+            if bytes_out > 100 * 1024 * 1024:
+                anomalies['high_severity'].append({
+                    'type': 'large_data_transfer',
+                    'severity': 'high',
+                    'connection': connection,
+                    'bytes_transferred': bytes_out,
+                    'packet_count': packet_count,
+                    'description': f'Large outbound data transfer - {bytes_out / (1024*1024):.1f} MB',
+                    'timestamp': datetime.now().isoformat(),
+                    'confidence': min(100, bytes_out // (10 * 1024 * 1024))
+                })
+            # Medium data transfers (> 10MB)
+            elif bytes_out > 10 * 1024 * 1024:
+                anomalies['medium_severity'].append({
+                    'type': 'medium_data_transfer',
+                    'severity': 'medium',
+                    'connection': connection,
+                    'bytes_transferred': bytes_out,
+                    'packet_count': packet_count,
+                    'description': f'Significant outbound data transfer - {bytes_out / (1024*1024):.1f} MB',
+                    'timestamp': datetime.now().isoformat(),
+                    'confidence': bytes_out // (1024 * 1024)
+                })
+        
+        return anomalies
+    
+    def _detect_suspicious_ports(self, parsed_data: Dict[str, Any]) -> Dict[str, Any]:
+        """Detect connections to suspicious ports"""
+        anomalies = {'high_severity': [], 'medium_severity': [], 'low_severity': []}
+        
+        suspicious_connections = defaultdict(list)
+        
+        for packet in parsed_data['packets']:
+            dst_port = packet.get('dst_port')
+            src_port = packet.get('src_port')
+            src_ip = packet.get('src_ip')
+            dst_ip = packet.get('dst_ip')
+            
+            if dst_port in self.suspicious_ports:
+                suspicious_connections[dst_port].append({
+                    'src_ip': src_ip,
+                    'dst_ip': dst_ip,
+                    'timestamp': packet.get('timestamp', datetime.now().isoformat())
+                })
+            elif src_port in self.suspicious_ports:
+                suspicious_connections[src_port].append({
+                    'src_ip': src_ip,
+                    'dst_ip': dst_ip,
+                    'timestamp': packet.get('timestamp', datetime.now().isoformat())
+                })
+        
+        for port, connections in suspicious_connections.items():
+            unique_ips = len(set(conn['src_ip'] for conn in connections if conn['src_ip']))
+            
+            if len(connections) > 10:
+                anomalies['high_severity'].append({
+                    'type': 'suspicious_port_activity',
+                    'severity': 'high',
+                    'port': port,
+                    'connection_count': len(connections),
+                    'unique_sources': unique_ips,
+                    'description': f'High activity on suspicious port {port} - {len(connections)} connections',
+                    'timestamp': datetime.now().isoformat(),
+                    'confidence': min(100, len(connections) * 5)
+                })
+            elif len(connections) > 5:
+                anomalies['medium_severity'].append({
+                    'type': 'suspicious_port_activity',
+                    'severity': 'medium',
+                    'port': port,
+                    'connection_count': len(connections),
+                    'unique_sources': unique_ips,
+                    'description': f'Activity detected on suspicious port {port} - {len(connections)} connections',
+                    'timestamp': datetime.now().isoformat(),
+                    'confidence': len(connections) * 10
+                })
+        
+        return anomalies
+    
+    def _detect_packet_size_anomalies(self, parsed_data: Dict[str, Any]) -> Dict[str, Any]:
+        """Detect unusual packet size patterns"""
+        anomalies = {'high_severity': [], 'medium_severity': [], 'low_severity': []}
+        
+        packet_sizes = [p.get('length', 0) for p in parsed_data['packets'] if p.get('length')]
+        
+        if len(packet_sizes) < 10:
+            return anomalies
+        
+        # Calculate statistics
+        mean_size = statistics.mean(packet_sizes)
+        std_dev = statistics.stdev(packet_sizes) if len(packet_sizes) > 1 else 0
+        
+        # Identify outliers
+        threshold = mean_size + (self.protocol_thresholds['packet_size_std_dev_multiplier'] * std_dev)
+        large_packets = [size for size in packet_sizes if size > threshold]
+        
+        if len(large_packets) > len(packet_sizes) * 0.1:  # More than 10% are outliers
+            anomalies['medium_severity'].append({
+                'type': 'packet_size_anomaly',
+                'severity': 'medium',
+                'outlier_count': len(large_packets),
+                'total_packets': len(packet_sizes),
+                'mean_size': round(mean_size, 2),
+                'threshold': round(threshold, 2),
+                'description': f'Unusual packet size distribution - {len(large_packets)} outliers detected',
+                'timestamp': datetime.now().isoformat(),
+                'confidence': min(100, (len(large_packets) / len(packet_sizes)) * 100)
+            })
+        
+        return anomalies
+    
+    def _detect_timing_anomalies(self, parsed_data: Dict[str, Any]) -> Dict[str, Any]:
+        """Detect unusual timing patterns in network traffic"""
+        anomalies = {'high_severity': [], 'medium_severity': [], 'low_severity': []}
+        
+        # This is a simplified timing analysis
+        # In a real implementation, you'd want more sophisticated time-based analysis
+        
+        packets = parsed_data['packets']
+        if len(packets) < 10:
+            return anomalies
+        
+        # Check for burst patterns (many packets in short time)
+        packet_times = []
+        for packet in packets:
+            if 'timestamp' in packet:
+                try:
+                    if isinstance(packet['timestamp'], str):
+                        # Parse ISO format timestamp
+                        packet_times.append(datetime.fromisoformat(packet['timestamp'].replace('Z', '+00:00')))
+                    else:
+                        packet_times.append(packet['timestamp'])
+                except:
+                    continue
+        
+        if len(packet_times) > 10:
+            packet_times.sort()
+            
+            # Look for time windows with unusually high packet density
+            window_size = timedelta(seconds=1)
+            for i in range(len(packet_times) - 50):
+                window_end = packet_times[i] + window_size
+                packets_in_window = sum(1 for t in packet_times[i:] if t <= window_end)
+                
+                if packets_in_window > 100:  # > 100 packets per second
+                    anomalies['medium_severity'].append({
+                        'type': 'traffic_burst',
+                        'severity': 'medium',
+                        'packets_per_second': packets_in_window,
+                        'window_start': packet_times[i].isoformat(),
+                        'description': f'Traffic burst detected - {packets_in_window} packets in 1 second',
+                        'timestamp': datetime.now().isoformat(),
+                        'confidence': min(100, packets_in_window // 2)
+                    })
+                    break  # Only report first burst to avoid spam
+        
+        return anomalies
+    
+    def _detect_protocol_anomalies(self, parsed_data: Dict[str, Any]) -> Dict[str, Any]:
+        """Detect unusual protocol usage patterns"""
+        anomalies = {'high_severity': [], 'medium_severity': [], 'low_severity': []}
+        
+        # Count protocol usage
+        protocol_counts = Counter()
+        for packet in parsed_data['packets']:
+            protocol = packet.get('protocol', 'Unknown')
+            protocol_counts[protocol] += 1
+        
+        total_packets = sum(protocol_counts.values())
+        
+        # Check for unusual protocol distributions
+        for protocol, count in protocol_counts.items():
+            percentage = (count / total_packets) * 100
+            
+            # Flag protocols that shouldn't be dominant
+            if protocol in ['ICMP'] and percentage > 50:
+                anomalies['medium_severity'].append({
+                    'type': 'unusual_protocol_distribution',
+                    'severity': 'medium',
+                    'protocol': protocol,
+                    'packet_count': count,
+                    'percentage': round(percentage, 2),
+                    'description': f'Unusual {protocol} traffic dominance - {percentage:.1f}% of all packets',
+                    'timestamp': datetime.now().isoformat(),
+                    'confidence': min(100, percentage)
+                })
+        
+        return anomalies
+    
+    def _detect_geographic_anomalies(self, parsed_data: Dict[str, Any]) -> Dict[str, Any]:
+        """Detect connections to/from unusual geographic locations"""
+        anomalies = {'high_severity': [], 'medium_severity': [], 'low_severity': []}
+        
+        # This is a placeholder for geographic analysis
+        # In a real implementation, you'd use IP geolocation databases
+        
+        external_ips = set()
+        for packet in parsed_data['packets']:
+            for ip_field in ['src_ip', 'dst_ip']:
+                ip = packet.get(ip_field)
+                if ip:
+                    try:
+                        addr = ipaddress.IPv4Address(ip)
+                        if not any(addr in net for net in self.private_ranges):
+                            external_ips.add(ip)
+                    except ipaddress.AddressValueError:
+                        continue
+        
+        if len(external_ips) > 100:
+            anomalies['low_severity'].append({
+                'type': 'multiple_external_connections',
+                'severity': 'low',
+                'external_ip_count': len(external_ips),
+                'description': f'High number of external IP connections - {len(external_ips)} unique IPs',
+                'timestamp': datetime.now().isoformat(),
+                'confidence': min(100, len(external_ips) // 10)
+            })
+        
+        return anomalies
+    
+    def _detect_frequency_anomalies(self, parsed_data: Dict[str, Any]) -> Dict[str, Any]:
+        """Detect unusual frequency patterns in network connections"""
+        anomalies = {'high_severity': [], 'medium_severity': [], 'low_severity': []}
+        
+        # Track connection frequencies
+        connection_pairs = defaultdict(int)
+        
+        for packet in parsed_data['packets']:
+            src_ip = packet.get('src_ip')
+            dst_ip = packet.get('dst_ip')
+            dst_port = packet.get('dst_port')
+            
+            if src_ip and dst_ip and dst_port:
+                connection_key = f"{src_ip}->{dst_ip}:{dst_port}"
+                connection_pairs[connection_key] += 1
+        
+        # Identify high-frequency connections
+        total_packets = len(parsed_data['packets'])
+        
+        for connection, count in connection_pairs.items():
+            frequency = (count / total_packets) * 100
+            
+            if frequency > 20:  # Connection represents > 20% of all traffic
+                anomalies['medium_severity'].append({
+                    'type': 'high_frequency_connection',
+                    'severity': 'medium',
+                    'connection': connection,
+                    'packet_count': count,
+                    'frequency_percentage': round(frequency, 2),
+                    'description': f'High-frequency connection - {connection} ({frequency:.1f}% of traffic)',
+                    'timestamp': datetime.now().isoformat(),
+                    'confidence': min(100, frequency * 2)
+                })
+        
+        return anomalies
+    
+    def _merge_anomalies(self, main_anomalies: Dict[str, Any], method_anomalies: Dict[str, Any]) -> None:
+        """Merge anomalies from a detection method into the main anomaly dict"""
+        for severity in ['high_severity', 'medium_severity', 'low_severity']:
+            if severity in method_anomalies:
+                main_anomalies[severity].extend(method_anomalies[severity])
+        
+        # Update total count
+        total = sum(len(main_anomalies[severity]) for severity in ['high_severity', 'medium_severity', 'low_severity'])
+        main_anomalies['total_anomalies'] = total
+        
+        # Update anomaly types count
+        for severity in ['high_severity', 'medium_severity', 'low_severity']:
+            for anomaly in main_anomalies[severity]:
+                anomaly_type = anomaly.get('type', 'unknown')
+                if anomaly_type not in main_anomalies['anomaly_types']:
+                    main_anomalies['anomaly_types'][anomaly_type] = 0
+                main_anomalies['anomaly_types'][anomaly_type] += 1
+    
+    def _generate_recommendations(self, anomalies: Dict[str, Any]) -> List[str]:
+        """Generate security recommendations based on detected anomalies"""
+        recommendations = []
+        
+        # Check for specific anomaly types and generate recommendations
+        anomaly_types = anomalies.get('anomaly_types', {})
+        
+        if 'port_scan' in anomaly_types:
+            recommendations.append("Implement intrusion detection system (IDS) to monitor and block port scanning attempts")
+            recommendations.append("Configure firewall rules to limit port accessibility from external networks")
+        
+        if 'syn_flood' in anomaly_types:
+            recommendations.append("Enable SYN flood protection on network devices and firewalls")
+            recommendations.append("Implement rate limiting for incoming connections")
+        
+        if 'dns_tunneling' in anomaly_types:
+            recommendations.append("Monitor DNS traffic for unusual patterns and payload sizes")
+            recommendations.append("Consider implementing DNS filtering and monitoring solutions")
+        
+        if 'large_data_transfer' in anomaly_types or 'medium_data_transfer' in anomaly_types:
+            recommendations.append("Implement data loss prevention (DLP) solutions")
+            recommendations.append("Monitor and log large outbound data transfers")
+            recommendations.append("Review user access permissions and data classification")
+        
+        if 'suspicious_port_activity' in anomaly_types:
+            recommendations.append("Block or restrict access to known malicious ports")
+            recommendations.append("Regularly update threat intelligence feeds")
+        
+        if len(anomalies['high_severity']) > 0:
+            recommendations.append("Immediately investigate high-severity anomalies")
+            recommendations.append("Consider isolating affected systems for forensic analysis")
+        
+        # General recommendations
+        if anomalies['total_anomalies'] > 10:
+            recommendations.append("Implement continuous network monitoring and alerting")
+            recommendations.append("Conduct regular security assessments and penetration testing")
+            recommendations.append("Ensure all systems are updated with latest security patches")
+        
+        return list(set(recommendations))  # Remove duplicates
+    
+    def get_anomaly_summary(self, anomalies: Dict[str, Any]) -> Dict[str, Any]:
+        """Generate a summary of detected anomalies"""
+        return {
+            'total_anomalies': anomalies['total_anomalies'],
+            'high_severity_count': len(anomalies['high_severity']),
+            'medium_severity_count': len(anomalies['medium_severity']),
+            'low_severity_count': len(anomalies['low_severity']),
+            'anomaly_types': anomalies['anomaly_types'],
+            'top_recommendations': anomalies['recommendations'][:5],  # Top 5 recommendations
+            'risk_score': self._calculate_risk_score(anomalies)
+        }
+    
+    def _calculate_risk_score(self, anomalies: Dict[str, Any]) -> int:
+        """Calculate overall risk score based on anomalies (0-100)"""
+        high_count = len(anomalies['high_severity'])
+        medium_count = len(anomalies['medium_severity'])
+        low_count = len(anomalies['low_severity'])
+        
+        # Weighted risk calculation
+        risk_score = (high_count * 10) + (medium_count * 5) + (low_count * 2)
+        
+        # Cap at 100
+        return min(100, risk_score)
