@@ -1,0 +1,508 @@
+"""
+utils/summarizer.py
+===================
+Traffic summarization utilities for Packet Buddy
+"""
+
+import asyncio
+import logging
+from datetime import datetime
+from typing import Dict, List, Any, Optional
+from collections import Counter, defaultdict
+import statistics
+
+logger = logging.getLogger(__name__)
+
+class TrafficSummarizer:
+    """Generate comprehensive traffic summaries from parsed PCAP data"""
+    
+    def __init__(self):
+        self.common_ports = {
+            20: 'FTP-DATA', 21: 'FTP', 22: 'SSH', 23: 'TELNET', 25: 'SMTP',
+            53: 'DNS', 67: 'DHCP-SERVER', 68: 'DHCP-CLIENT', 69: 'TFTP',
+            80: 'HTTP', 110: 'POP3', 119: 'NNTP', 123: 'NTP', 143: 'IMAP',
+            161: 'SNMP', 194: 'IRC', 389: 'LDAP', 443: 'HTTPS', 993: 'IMAPS',
+            995: 'POP3S', 587: 'SMTP-SUBMISSION', 465: 'SMTPS', 990: 'FTPS',
+            3389: 'RDP', 5432: 'POSTGRESQL', 3306: 'MYSQL', 1433: 'MSSQL',
+            6379: 'REDIS', 27017: 'MONGODB', 5672: 'RABBITMQ'
+        }
+    
+    async def generate_summary(self, parsed_data: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Generate comprehensive traffic summary
+        
+        Args:
+            parsed_data: Output from PCAPParser
+            
+        Returns:
+            Structured traffic summary
+        """
+        try:
+            logger.info("Generating traffic summary")
+            
+            # Use asyncio to prevent blocking
+            loop = asyncio.get_event_loop()
+            summary = await loop.run_in_executor(
+                None, self._generate_summary_sync, parsed_data
+            )
+            
+            logger.info("Traffic summary generated successfully")
+            return summary
+            
+        except Exception as e:
+            logger.error(f"Summary generation failed: {str(e)}")
+            raise
+    
+    def _generate_summary_sync(self, parsed_data: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Synchronous summary generation
+        
+        Args:
+            parsed_data: Parsed PCAP data
+            
+        Returns:
+            Traffic summary
+        """
+        summary = {
+            'total_packets': parsed_data['total_packets'],
+            'total_bytes': parsed_data['total_bytes'],
+            'duration_seconds': parsed_data['duration'],
+            'unique_src_ips': parsed_data['unique_src_ips'],
+            'unique_dst_ips': parsed_data['unique_dst_ips'],
+            'protocols': parsed_data['protocols'],
+            'top_talkers': self._analyze_top_talkers(parsed_data),
+            'port_analysis': self._analyze_ports(parsed_data),
+            'timeline': self._generate_timeline(parsed_data),
+            'packet_size_stats': self._analyze_packet_sizes(parsed_data),
+            'protocol_distribution': self._analyze_protocol_distribution(parsed_data),
+            'conversation_analysis': self._analyze_conversations(parsed_data),
+            'traffic_patterns': self._analyze_traffic_patterns(parsed_data),
+            'performance_metrics': self._calculate_performance_metrics(parsed_data)
+        }
+        
+        return summary
+    
+    def _analyze_top_talkers(self, parsed_data: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """
+        Identify top talking IP addresses
+        
+        Args:
+            parsed_data: Parsed PCAP data
+            
+        Returns:
+            List of top talkers with statistics
+        """
+        ip_stats = defaultdict(lambda: {'packets_sent': 0, 'packets_received': 0, 
+                                       'bytes_sent': 0, 'bytes_received': 0})
+        
+        for packet in parsed_data['packets']:
+            src_ip = packet.get('src_ip')
+            dst_ip = packet.get('dst_ip')
+            packet_size = packet['length']
+            
+            if src_ip:
+                ip_stats[src_ip]['packets_sent'] += 1
+                ip_stats[src_ip]['bytes_sent'] += packet_size
+            
+            if dst_ip:
+                ip_stats[dst_ip]['packets_received'] += 1
+                ip_stats[dst_ip]['bytes_received'] += packet_size
+        
+        # Calculate total activity for each IP
+        top_talkers = []
+        for ip, stats in ip_stats.items():
+            total_packets = stats['packets_sent'] + stats['packets_received']
+            total_bytes = stats['bytes_sent'] + stats['bytes_received']
+            
+            top_talkers.append({
+                'ip_address': ip,
+                'total_packets': total_packets,
+                'total_bytes': total_bytes,
+                'packets_sent': stats['packets_sent'],
+                'packets_received': stats['packets_received'],
+                'bytes_sent': stats['bytes_sent'],
+                'bytes_received': stats['bytes_received'],
+                'percentage_of_traffic': (total_bytes / parsed_data['total_bytes']) * 100
+            })
+        
+        # Sort by total bytes and return top 10
+        return sorted(top_talkers, key=lambda x: x['total_bytes'], reverse=True)[:10]
+    
+    def _analyze_ports(self, parsed_data: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Analyze port usage and identify services
+        
+        Args:
+            parsed_data: Parsed PCAP data
+            
+        Returns:
+            Port analysis results
+        """
+        src_port_stats = Counter()
+        dst_port_stats = Counter()
+        service_stats = Counter()
+        
+        for packet in parsed_data['packets']:
+            src_port = packet.get('src_port')
+            dst_port = packet.get('dst_port')
+            
+            if src_port:
+                src_port_stats[src_port] += 1
+                service = self.common_ports.get(src_port, f'Unknown-{src_port}')
+                service_stats[service] += 1
+            
+            if dst_port:
+                dst_port_stats[dst_port] += 1
+                service = self.common_ports.get(dst_port, f'Unknown-{dst_port}')
+                service_stats[service] += 1
+        
+        return {
+            'top_source_ports': [
+                {'port': port, 'count': count, 'service': self.common_ports.get(port, 'Unknown')}
+                for port, count in src_port_stats.most_common(10)
+            ],
+            'top_destination_ports': [
+                {'port': port, 'count': count, 'service': self.common_ports.get(port, 'Unknown')}
+                for port, count in dst_port_stats.most_common(10)
+            ],
+            'top_services': [
+                {'service': service, 'count': count}
+                for service, count in service_stats.most_common(10)
+            ],
+            'unique_ports': {
+                'source': len(src_port_stats),
+                'destination': len(dst_port_stats)
+            }
+        }
+    
+    def _generate_timeline(self, parsed_data: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """
+        Generate traffic timeline with time-based statistics
+        
+        Args:
+            parsed_data: Parsed PCAP data
+            
+        Returns:
+            Timeline data points
+        """
+        if not parsed_data['timestamps'] or parsed_data['duration'] <= 0:
+            return []
+        
+        # Create time buckets (aim for ~50 buckets)
+        duration = parsed_data['duration']
+        bucket_size = max(1, duration / 50)  # At least 1 second buckets
+        num_buckets = int(duration / bucket_size) + 1
+        
+        # Initialize buckets
+        buckets = [{'time': i * bucket_size, 'packets': 0, 'bytes': 0, 'protocols': Counter()}
+                  for i in range(num_buckets)]
+        
+        start_time = parsed_data['start_time']
+        
+        # Fill buckets with packet data
+        for packet in parsed_data['packets']:
+            time_offset = packet['timestamp'] - start_time
+            bucket_index = min(int(time_offset / bucket_size), num_buckets - 1)
+            
+            buckets[bucket_index]['packets'] += 1
+            buckets[bucket_index]['bytes'] += packet['length']
+            buckets[bucket_index]['protocols'][packet['protocol']] += 1
+        
+        # Convert to final format
+        timeline = []
+        for bucket in buckets:
+            timeline.append({
+                'time_offset': bucket['time'],
+                'packets': bucket['packets'],
+                'bytes': bucket['bytes'],
+                'top_protocol': bucket['protocols'].most_common(1)[0][0] if bucket['protocols'] else 'None'
+            })
+        
+        return timeline
+    
+    def _analyze_packet_sizes(self, parsed_data: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Analyze packet size distribution
+        
+        Args:
+            parsed_data: Parsed PCAP data
+            
+        Returns:
+            Packet size statistics
+        """
+        sizes = parsed_data['packet_sizes']
+        
+        if not sizes:
+            return {}
+        
+        return {
+            'min_size': min(sizes),
+            'max_size': max(sizes),
+            'mean_size': statistics.mean(sizes),
+            'median_size': statistics.median(sizes),
+            'mode_size': statistics.mode(sizes) if sizes else 0,
+            'std_dev': statistics.stdev(sizes) if len(sizes) > 1 else 0,
+            'percentiles': {
+                '25th': self._percentile(sizes, 25),
+                '75th': self._percentile(sizes, 75),
+                '90th': self._percentile(sizes, 90),
+                '95th': self._percentile(sizes, 95),
+                '99th': self._percentile(sizes, 99)
+            },
+            'size_distribution': self._categorize_packet_sizes(sizes)
+        }
+    
+    def _percentile(self, data: List[float], p: float) -> float:
+        """Calculate percentile of data"""
+        sorted_data = sorted(data)
+        index = (p / 100) * (len(sorted_data) - 1)
+        if index.is_integer():
+            return sorted_data[int(index)]
+        else:
+            lower = sorted_data[int(index)]
+            upper = sorted_data[int(index) + 1]
+            return lower + (upper - lower) * (index - int(index))
+    
+    def _categorize_packet_sizes(self, sizes: List[int]) -> Dict[str, int]:
+        """Categorize packets by size ranges"""
+        categories = {
+            'tiny (1-64 bytes)': 0,
+            'small (65-512 bytes)': 0,
+            'medium (513-1500 bytes)': 0,
+            'large (1501-9000 bytes)': 0,
+            'jumbo (>9000 bytes)': 0
+        }
+        
+        for size in sizes:
+            if size <= 64:
+                categories['tiny (1-64 bytes)'] += 1
+            elif size <= 512:
+                categories['small (65-512 bytes)'] += 1
+            elif size <= 1500:
+                categories['medium (513-1500 bytes)'] += 1
+            elif size <= 9000:
+                categories['large (1501-9000 bytes)'] += 1
+            else:
+                categories['jumbo (>9000 bytes)'] += 1
+        
+        return categories
+    
+    def _analyze_protocol_distribution(self, parsed_data: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Analyze protocol distribution and relationships
+        
+        Args:
+            parsed_data: Parsed PCAP data
+            
+        Returns:
+            Protocol analysis results
+        """
+        protocols = parsed_data['protocols']
+        total_packets = parsed_data['total_packets']
+        
+        protocol_analysis = {}
+        for protocol, count in protocols.items():
+            percentage = (count / total_packets) * 100
+            protocol_analysis[protocol] = {
+                'packet_count': count,
+                'percentage': percentage
+            }
+        
+        # Calculate bytes per protocol
+        protocol_bytes = Counter()
+        for packet in parsed_data['packets']:
+            protocol_bytes[packet['protocol']] += packet['length']
+        
+        for protocol in protocol_analysis:
+            if protocol in protocol_bytes:
+                protocol_analysis[protocol]['bytes'] = protocol_bytes[protocol]
+                protocol_analysis[protocol]['avg_packet_size'] = protocol_bytes[protocol] / protocols[protocol]
+        
+        return {
+            'distribution': protocol_analysis,
+            'diversity_index': len(protocols),  # Simple diversity measure
+            'dominant_protocol': max(protocols, key=protocols.get) if protocols else None
+        }
+    
+    def _analyze_conversations(self, parsed_data: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Analyze network conversations
+        
+        Args:
+            parsed_data: Parsed PCAP data
+            
+        Returns:
+            Conversation analysis
+        """
+        conversations = parsed_data.get('conversations', [])
+        
+        if not conversations:
+            return {'total_conversations': 0}
+        
+        # Sort conversations by various metrics
+        by_packets = sorted(conversations, key=lambda x: x['packets'], reverse=True)
+        by_bytes = sorted(conversations, key=lambda x: x['bytes'], reverse=True)
+        
+        return {
+            'total_conversations': len(conversations),
+            'top_by_packets': by_packets[:5],
+            'top_by_bytes': by_bytes[:5],
+            'avg_packets_per_conversation': sum(c['packets'] for c in conversations) / len(conversations),
+            'avg_bytes_per_conversation': sum(c['bytes'] for c in conversations) / len(conversations)
+        }
+    
+    def _analyze_traffic_patterns(self, parsed_data: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Identify traffic patterns and anomalies
+        
+        Args:
+            parsed_data: Parsed PCAP data
+            
+        Returns:
+            Traffic pattern analysis
+        """
+        packets = parsed_data['packets']
+        
+        if len(packets) < 2:
+            return {}
+        
+        # Analyze inter-arrival times
+        arrival_times = []
+        for i in range(1, len(packets)):
+            time_diff = packets[i]['timestamp'] - packets[i-1]['timestamp']
+            arrival_times.append(time_diff)
+        
+        # Traffic intensity analysis
+        timeline = self._generate_timeline(parsed_data)
+        packet_rates = [bucket['packets'] for bucket in timeline if bucket['packets'] > 0]
+        
+        patterns = {
+            'avg_inter_arrival_time': statistics.mean(arrival_times) if arrival_times else 0,
+            'traffic_variability': statistics.stdev(packet_rates) if len(packet_rates) > 1 else 0,
+            'peak_traffic_rate': max(packet_rates) if packet_rates else 0,
+            'min_traffic_rate': min(packet_rates) if packet_rates else 0
+        }
+        
+        # Identify potential patterns
+        patterns['potential_patterns'] = []
+        
+        if patterns['traffic_variability'] < patterns['peak_traffic_rate'] * 0.1:
+            patterns['potential_patterns'].append('Steady traffic')
+        
+        if patterns['peak_traffic_rate'] > patterns['min_traffic_rate'] * 10:
+            patterns['potential_patterns'].append('Bursty traffic')
+        
+        # Check for periodic behavior (simplified)
+        if len(timeline) > 10:
+            rates = [bucket['packets'] for bucket in timeline]
+            if self._detect_periodicity(rates):
+                patterns['potential_patterns'].append('Periodic traffic')
+        
+        return patterns
+    
+    def _detect_periodicity(self, data: List[int]) -> bool:
+        """
+        Simple periodicity detection
+        
+        Args:
+            data: Time series data
+            
+        Returns:
+            True if periodic pattern detected
+        """
+        if len(data) < 6:
+            return False
+        
+        # Look for repeating patterns of length 2-5
+        for period in range(2, min(6, len(data) // 3)):
+            matches = 0
+            for i in range(period, len(data) - period):
+                if abs(data[i] - data[i - period]) <= 1:  # Allow small variation
+                    matches += 1
+            
+            if matches > len(data) * 0.6:  # 60% matches indicate periodicity
+                return True
+        
+        return False
+    
+    def _calculate_performance_metrics(self, parsed_data: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Calculate network performance metrics
+        
+        Args:
+            parsed_data: Parsed PCAP data
+            
+        Returns:
+            Performance metrics
+        """
+        duration = parsed_data['duration']
+        total_bytes = parsed_data['total_bytes']
+        total_packets = parsed_data['total_packets']
+        
+        if duration <= 0:
+            return {}
+        
+        metrics = {
+            'throughput_bps': total_bytes * 8 / duration,  # bits per second
+            'throughput_Mbps': (total_bytes * 8 / duration) / 1_000_000,  # Megabits per second
+            'packet_rate': total_packets / duration,  # packets per second
+            'efficiency': self._calculate_efficiency(parsed_data),
+            'utilization_estimate': self._estimate_utilization(parsed_data)
+        }
+        
+        return metrics
+    
+    def _calculate_efficiency(self, parsed_data: Dict[str, Any]) -> float:
+        """
+        Calculate network efficiency (payload vs overhead ratio)
+        
+        Args:
+            parsed_data: Parsed PCAP data
+            
+        Returns:
+            Efficiency ratio (0-1)
+        """
+        # Simplified efficiency calculation
+        # Assumes average header overhead of 54 bytes (Ethernet + IP + TCP)
+        total_bytes = parsed_data['total_bytes']
+        total_packets = parsed_data['total_packets']
+        
+        if total_packets == 0:
+            return 0
+        
+        estimated_overhead = total_packets * 54
+        estimated_payload = max(0, total_bytes - estimated_overhead)
+        
+        return estimated_payload / total_bytes if total_bytes > 0 else 0
+    
+    def _estimate_utilization(self, parsed_data: Dict[str, Any]) -> Dict[str, float]:
+        """
+        Estimate network utilization for common link speeds
+        
+        Args:
+            parsed_data: Parsed PCAP data
+            
+        Returns:
+            Utilization percentages for different link speeds
+        """
+        duration = parsed_data['duration']
+        total_bytes = parsed_data['total_bytes']
+        
+        if duration <= 0:
+            return {}
+        
+        throughput_bps = total_bytes * 8 / duration
+        
+        # Common link speeds in bps
+        link_speeds = {
+            '10Mbps': 10_000_000,
+            '100Mbps': 100_000_000,
+            '1Gbps': 1_000_000_000,
+            '10Gbps': 10_000_000_000
+        }
+        
+        utilization = {}
+        for speed_name, speed_bps in link_speeds.items():
+            utilization[speed_name] = min(100, (throughput_bps / speed_bps) * 100)
+        
+        return utilization
