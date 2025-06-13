@@ -1,0 +1,392 @@
+"""
+utils/parser.py
+===============
+PCAP parsing utilities for Packet Buddy
+"""
+
+import asyncio
+import logging
+from datetime import datetime
+from typing import Dict, List, Any, Optional
+from pathlib import Path
+
+try:
+    import scapy.all as scapy
+    from scapy.layers.inet import IP, TCP, UDP, ICMP
+    from scapy.layers.l2 import Ether
+    from scapy.layers.inet6 import IPv6
+except ImportError:
+    raise ImportError("scapy is required. Install with: pip install scapy")
+
+logger = logging.getLogger(__name__)
+
+class PCAPParser:
+    """PCAP file parser using Scapy"""
+    
+    def __init__(self):
+        self.supported_formats = ['.pcap', '.pcapng', '.cap']
+    
+    async def parse_pcap(self, file_path: str) -> Dict[str, Any]:
+        """
+        Parse PCAP file and extract structured data
+        
+        Args:
+            file_path: Path to PCAP file
+            
+        Returns:
+            Dictionary containing parsed packet data
+        """
+        try:
+            logger.info(f"Starting PCAP parsing: {file_path}")
+            
+            if not Path(file_path).exists():
+                raise FileNotFoundError(f"PCAP file not found: {file_path}")
+            
+            # Use asyncio to prevent blocking
+            loop = asyncio.get_event_loop()
+            parsed_data = await loop.run_in_executor(
+                None, self._parse_packets, file_path
+            )
+            
+            logger.info(f"PCAP parsing completed: {parsed_data['total_packets']} packets")
+            return parsed_data
+            
+        except Exception as e:
+            logger.error(f"PCAP parsing failed: {str(e)}")
+            raise
+    
+    def _parse_packets(self, file_path: str) -> Dict[str, Any]:
+        """
+        Internal method to parse packets synchronously
+        
+        Args:
+            file_path: Path to PCAP file
+            
+        Returns:
+            Parsed packet data
+        """
+        try:
+            # Read packets
+            packets = scapy.rdpcap(file_path)
+            
+            if not packets:
+                raise ValueError("No packets found in PCAP file")
+            
+            # Initialize data structures
+            parsed_data = {
+                'total_packets': len(packets),
+                'total_bytes': 0,
+                'start_time': None,
+                'end_time': None,
+                'duration': 0,
+                'packets': [],
+                'protocols': {},
+                'src_ips': set(),
+                'dst_ips': set(),
+                'src_ports': set(),
+                'dst_ports': set(),
+                'conversations': {},
+                'packet_sizes': [],
+                'timestamps': []
+            }
+            
+            # Process each packet
+            for i, packet in enumerate(packets):
+                packet_info = self._extract_packet_info(packet, i)
+                parsed_data['packets'].append(packet_info)
+                
+                # Update aggregated statistics
+                self._update_statistics(parsed_data, packet_info, packet)
+            
+            # Calculate final statistics
+            self._finalize_statistics(parsed_data)
+            
+            return parsed_data
+            
+        except Exception as e:
+            logger.error(f"Packet parsing error: {str(e)}")
+            raise
+    
+    def _extract_packet_info(self, packet, index: int) -> Dict[str, Any]:
+        """
+        Extract information from a single packet
+        
+        Args:
+            packet: Scapy packet object
+            index: Packet index
+            
+        Returns:
+            Dictionary containing packet information
+        """
+        packet_info = {
+            'index': index,
+            'timestamp': packet.time,
+            'length': len(packet),
+            'protocol': 'Unknown',
+            'src_ip': None,
+            'dst_ip': None,
+            'src_port': None,
+            'dst_port': None,
+            'flags': [],
+            'summary': packet.summary(),
+            'layers': []
+        }
+        
+        # Extract layer information
+        current_layer = packet
+        while current_layer:
+            layer_name = current_layer.__class__.__name__
+            packet_info['layers'].append(layer_name)
+            current_layer = current_layer.payload if hasattr(current_layer, 'payload') else None
+        
+        # Extract network layer info
+        if IP in packet:
+            packet_info.update({
+                'src_ip': packet[IP].src,
+                'dst_ip': packet[IP].dst,
+                'protocol': packet[IP].proto,
+                'ttl': packet[IP].ttl,
+                'ip_version': 4
+            })
+        elif IPv6 in packet:
+            packet_info.update({
+                'src_ip': packet[IPv6].src,
+                'dst_ip': packet[IPv6].dst,
+                'protocol': packet[IPv6].nh,
+                'hop_limit': packet[IPv6].hlim,
+                'ip_version': 6
+            })
+        
+        # Extract transport layer info
+        if TCP in packet:
+            packet_info.update({
+                'src_port': packet[TCP].sport,
+                'dst_port': packet[TCP].dport,
+                'protocol': 'TCP',
+                'flags': self._get_tcp_flags(packet[TCP].flags),
+                'seq': packet[TCP].seq,
+                'ack': packet[TCP].ack,
+                'window': packet[TCP].window
+            })
+        elif UDP in packet:
+            packet_info.update({
+                'src_port': packet[UDP].sport,
+                'dst_port': packet[UDP].dport,
+                'protocol': 'UDP',
+                'length': packet[UDP].len
+            })
+        elif ICMP in packet:
+            packet_info.update({
+                'protocol': 'ICMP',
+                'type': packet[ICMP].type,
+                'code': packet[ICMP].code
+            })
+        
+        # Extract ethernet info
+        if Ether in packet:
+            packet_info.update({
+                'src_mac': packet[Ether].src,
+                'dst_mac': packet[Ether].dst,
+                'eth_type': packet[Ether].type
+            })
+        
+        return packet_info
+    
+    def _get_tcp_flags(self, flags: int) -> List[str]:
+        """
+        Convert TCP flags integer to list of flag names
+        
+        Args:
+            flags: TCP flags as integer
+            
+        Returns:
+            List of flag names
+        """
+        flag_names = {
+            0x01: 'FIN',
+            0x02: 'SYN', 
+            0x04: 'RST',
+            0x08: 'PSH',
+            0x10: 'ACK',
+            0x20: 'URG',
+            0x40: 'ECE',
+            0x80: 'CWR'
+        }
+        
+        active_flags = []
+        for flag_value, flag_name in flag_names.items():
+            if flags & flag_value:
+                active_flags.append(flag_name)
+        
+        return active_flags
+    
+    def _update_statistics(self, parsed_data: Dict[str, Any], packet_info: Dict[str, Any], packet) -> None:
+        """
+        Update running statistics with packet information
+        
+        Args:
+            parsed_data: Main data structure
+            packet_info: Current packet information
+            packet: Scapy packet object
+        """
+        # Update byte count
+        parsed_data['total_bytes'] += packet_info['length']
+        
+        # Update timestamps
+        timestamp = packet_info['timestamp']
+        if parsed_data['start_time'] is None or timestamp < parsed_data['start_time']:
+            parsed_data['start_time'] = timestamp
+        if parsed_data['end_time'] is None or timestamp > parsed_data['end_time']:
+            parsed_data['end_time'] = timestamp
+        
+        parsed_data['timestamps'].append(timestamp)
+        parsed_data['packet_sizes'].append(packet_info['length'])
+        
+        # Update protocol counts
+        protocol = packet_info['protocol']
+        parsed_data['protocols'][protocol] = parsed_data['protocols'].get(protocol, 0) + 1
+        
+        # Update IP addresses
+        if packet_info['src_ip']:
+            parsed_data['src_ips'].add(packet_info['src_ip'])
+        if packet_info['dst_ip']:
+            parsed_data['dst_ips'].add(packet_info['dst_ip'])
+        
+        # Update ports
+        if packet_info['src_port']:
+            parsed_data['src_ports'].add(packet_info['src_port'])
+        if packet_info['dst_port']:
+            parsed_data['dst_ports'].add(packet_info['dst_port'])
+        
+        # Update conversations
+        if packet_info['src_ip'] and packet_info['dst_ip']:
+            conv_key = tuple(sorted([packet_info['src_ip'], packet_info['dst_ip']]))
+            if conv_key not in parsed_data['conversations']:
+                parsed_data['conversations'][conv_key] = {
+                    'packets': 0,
+                    'bytes': 0,
+                    'protocols': set()
+                }
+            
+            parsed_data['conversations'][conv_key]['packets'] += 1
+            parsed_data['conversations'][conv_key]['bytes'] += packet_info['length']
+            parsed_data['conversations'][conv_key]['protocols'].add(protocol)
+    
+    def _finalize_statistics(self, parsed_data: Dict[str, Any]) -> None:
+        """
+        Finalize computed statistics
+        
+        Args:
+            parsed_data: Main data structure to finalize
+        """
+        # Calculate duration
+        if parsed_data['start_time'] and parsed_data['end_time']:
+            parsed_data['duration'] = parsed_data['end_time'] - parsed_data['start_time']
+        
+        # Convert sets to counts for JSON serialization
+        parsed_data['unique_src_ips'] = len(parsed_data['src_ips'])
+        parsed_data['unique_dst_ips'] = len(parsed_data['dst_ips'])
+        parsed_data['unique_src_ports'] = len(parsed_data['src_ports'])
+        parsed_data['unique_dst_ports'] = len(parsed_data['dst_ports'])
+        
+        # Convert sets to lists for JSON serialization
+        parsed_data['src_ips'] = list(parsed_data['src_ips'])
+        parsed_data['dst_ips'] = list(parsed_data['dst_ips'])
+        parsed_data['src_ports'] = list(parsed_data['src_ports'])
+        parsed_data['dst_ports'] = list(parsed_data['dst_ports'])
+        
+        # Process conversations
+        conversation_list = []
+        for conv_key, conv_data in parsed_data['conversations'].items():
+            conversation_list.append({
+                'endpoints': list(conv_key),
+                'packets': conv_data['packets'],
+                'bytes': conv_data['bytes'],
+                'protocols': list(conv_data['protocols'])
+            })
+        
+        # Sort conversations by packet count
+        parsed_data['conversations'] = sorted(
+            conversation_list,
+            key=lambda x: x['packets'],
+            reverse=True
+        )
+        
+        # Calculate packet rate
+        if parsed_data['duration'] > 0:
+            parsed_data['packets_per_second'] = parsed_data['total_packets'] / parsed_data['duration']
+            parsed_data['bytes_per_second'] = parsed_data['total_bytes'] / parsed_data['duration']
+        else:
+            parsed_data['packets_per_second'] = 0
+            parsed_data['bytes_per_second'] = 0
+        
+        logger.info(f"Statistics finalized - Duration: {parsed_data['duration']:.2f}s, "
+                   f"Packets/sec: {parsed_data['packets_per_second']:.2f}")
+
+    async def get_packet_details(self, file_path: str, packet_index: int) -> Dict[str, Any]:
+        """
+        Get detailed information for a specific packet
+        
+        Args:
+            file_path: Path to PCAP file
+            packet_index: Index of packet to analyze
+            
+        Returns:
+            Detailed packet information
+        """
+        try:
+            loop = asyncio.get_event_loop()
+            packet_details = await loop.run_in_executor(
+                None, self._get_packet_details_sync, file_path, packet_index
+            )
+            return packet_details
+            
+        except Exception as e:
+            logger.error(f"Failed to get packet details: {str(e)}")
+            raise
+    
+    def _get_packet_details_sync(self, file_path: str, packet_index: int) -> Dict[str, Any]:
+        """
+        Synchronous method to get packet details
+        
+        Args:
+            file_path: Path to PCAP file
+            packet_index: Index of packet to analyze
+            
+        Returns:
+            Detailed packet information
+        """
+        packets = scapy.rdpcap(file_path)
+        
+        if packet_index >= len(packets):
+            raise IndexError(f"Packet index {packet_index} out of range")
+        
+        packet = packets[packet_index]
+        
+        # Get basic packet info
+        packet_info = self._extract_packet_info(packet, packet_index)
+        
+        # Add detailed hex dump
+        packet_info['hex_dump'] = packet.hexdump(dump=True)
+        packet_info['raw_data'] = bytes(packet).hex()
+        
+        # Add layer-by-layer breakdown  
+        packet_info['layer_details'] = []
+        current_layer = packet
+        while current_layer:
+            layer_info = {
+                'name': current_layer.__class__.__name__,
+                'fields': {},
+                'size': len(current_layer)
+            }
+            
+            # Extract field values
+            for field_name, field_obj in current_layer.fields_desc:
+                if hasattr(current_layer, field_name):
+                    field_value = getattr(current_layer, field_name)
+                    layer_info['fields'][field_name] = str(field_value)
+            
+            packet_info['layer_details'].append(layer_info)
+            current_layer = current_layer.payload if hasattr(current_layer, 'payload') else None
+        
+        return packet_info
