@@ -1,410 +1,288 @@
+# packet_buddy_parser.py
+
 import pyshark
 import logging
-from typing import List, Dict, Any, Optional, Union
 from collections import defaultdict
 import json
-from datetime import datetime
+import datetime
 
-# Configure logging
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+# --- Configuration ---
+# Set up a basic logger. In a larger application, this would be configured externally.
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
 
 class PacketParser:
     """
-    Packet parsing engine for extracting structured information from PCAP/PCAPNG files.
-    Focuses on clean data extraction without analysis or summarization.
+    The core packet parsing engine for Packet Buddy.
+
+    This class uses PyShark to read PCAP/PCAPNG files and extract structured,
+    JSON-serializable data from each packet without performing analysis.
     """
-    
-    def __init__(self, max_packets: Optional[int] = None):
+
+    def __init__(self):
+        """Initializes the PacketParser."""
+        logging.info("Packet Buddy Parsing Engine initialized.")
+
+    def _get_field_value(self, obj, field_path, default=None):
         """
-        Initialize the packet parser.
+        Safely retrieves a nested attribute from a PyShark packet object.
+        This prevents crashes from missing layers or fields.
         
-        Args:
-            max_packets: Maximum number of packets to parse (None for all)
-        """
-        self.max_packets = max_packets
-        
-    def _safe_get_attr(self, obj: Any, attr_path: str, default: Any = None) -> Any:
-        """
-        Safely get attribute from PyShark object, handling nested attributes.
-        
-        Args:
-            obj: PyShark object
-            attr_path: Dot-separated attribute path (e.g., 'tcp.flags.syn')
-            default: Default value if attribute not found
-            
-        Returns:
-            Attribute value or default
+        Example: _get_field_value(packet, 'tcp.analysis.retransmission')
         """
         try:
-            attrs = attr_path.split('.')
-            current = obj
-            for attr in attrs:
-                if hasattr(current, attr):
-                    current = getattr(current, attr)
-                else:
-                    return default
-            return current
-        except (AttributeError, TypeError):
+            # Iteratively access nested attributes
+            value = obj
+            for part in field_path.split('.'):
+                value = getattr(value, part)
+            
+            # Convert PyShark Field objects to their native string/int value
+            return self._clean_pyshark_field(value)
+        except AttributeError:
             return default
-    
-    def _convert_value(self, value: Any) -> Any:
+
+    def _clean_pyshark_field(self, field):
         """
-        Convert PyShark values to clean, serializable types.
+        Converts a PyShark Field object to a clean, serializable value.
+        """
+        # The base_obj is the raw value (str, int, etc.)
+        if hasattr(field, 'base_obj'):
+             return field.base_obj
+        # If it's not a special PyShark object, return it as is
+        return field
+
+    def _extract_base_info(self, packet_num, packet):
+        """Extracts universal packet metadata."""
+        # This base structure ensures schema consistency for every packet.
+        data = {
+            "packet_num": packet_num,
+            "timestamp": None,
+            "protocol": None,
+            "packet_size": None,
+            "src_ip": None,
+            "dst_ip": None,
+            "src_port": None,
+            "dst_port": None,
+        }
         
+        # Basic packet metadata
+        if hasattr(packet, 'sniff_time'):
+            # Convert datetime object to ISO 8601 string format for JSON compatibility
+            data["timestamp"] = packet.sniff_time.isoformat()
+        data["protocol"] = self._get_field_value(packet, 'highest_layer')
+        data["packet_size"] = int(self._get_field_value(packet, 'length', 0))
+
+        # IP Layer
+        if 'IP' in packet:
+            data["src_ip"] = self._get_field_value(packet, 'ip.src')
+            data["dst_ip"] = self._get_field_value(packet, 'ip.dst')
+        elif 'IPV6' in packet: # Handle IPv6 as well
+            data["src_ip"] = self._get_field_value(packet, 'ipv6.src')
+            data["dst_ip"] = self._get_field_value(packet, 'ipv6.dst')
+
+        return data
+
+    def _extract_transport_layer_info(self, packet, data):
+        """Extracts TCP or UDP specific information."""
+        # TCP Layer
+        if 'TCP' in packet:
+            data["src_port"] = int(self._get_field_value(packet, 'tcp.srcport', 0))
+            data["dst_port"] = int(self._get_field_value(packet, 'tcp.dstport', 0))
+            data["tcp_flags"] = self._get_field_value(packet, 'tcp.flags')
+            # Use a boolean for retransmissions for cleaner data
+            data["tcp_retransmission"] = self._get_field_value(packet, 'tcp.analysis.retransmission') is not None
+            
+            # Check for handshake packets based on flags
+            flags = int(data["tcp_flags"], 16) if data["tcp_flags"] else 0
+            is_syn = (flags & 0x02) != 0
+            is_ack = (flags & 0x10) != 0
+            data["tcp_handshake_type"] = None
+            if is_syn and not is_ack:
+                data["tcp_handshake_type"] = "SYN"
+            elif is_syn and is_ack:
+                data["tcp_handshake_type"] = "SYN-ACK"
+
+        # UDP Layer
+        elif 'UDP' in packet:
+            data["src_port"] = int(self._get_field_value(packet, 'udp.srcport', 0))
+            data["dst_port"] = int(self._get_field_value(packet, 'udp.dstport', 0))
+
+    def _extract_application_layer_info(self, packet, data):
+        """Extracts data from specific application layer protocols."""
+        # DNS
+        if 'DNS' in packet:
+            data['dns_query_name'] = self._get_field_value(packet, 'dns.qry.name')
+            # DNS can have multiple 'A' records, so we collect them all
+            if hasattr(packet.dns, 'a'):
+                data['dns_response_ips'] = [self._clean_pyshark_field(a) for a in packet.dns.a_all]
+            
+        # NGAP (5G Core)
+        if 'NGAP' in packet:
+            data['ngap_procedure_code'] = int(self._get_field_value(packet, 'ngap.procedureCode', -1))
+            data['ngap_ran_ue_id'] = self._get_field_value(packet, 'ngap.ran_ue_ngap_id')
+        
+        # GTP (GPRS Tunneling Protocol)
+        if 'GTP' in packet:
+            data['gtp_message_type'] = int(self._get_field_value(packet, 'gtp.message_type', -1))
+            data['gtp_teid'] = self._get_field_value(packet, 'gtp.teid')
+            
+        # Add other custom protocol extractors here as needed...
+        # Example for HTTP:
+        # if 'HTTP' in packet:
+        #     data['http_host'] = self._get_field_value(packet, 'http.host')
+        #     data['http_request_method'] = self._get_field_value(packet, 'http.request.method')
+
+    def parse_pcap(self, file_path: str, packet_limit: int = None) -> list:
+        """
+        Reads a PCAP file and returns a list of dictionaries, one for each packet.
+
         Args:
-            value: Raw value from PyShark
-            
+            file_path (str): The path to the PCAP or PCAPNG file.
+            packet_limit (int, optional): The maximum number of packets to parse.
+                                          Useful for UI throttling or quick previews.
+
         Returns:
-            Clean, serializable value
+            list: A list of dictionaries, where each dictionary represents a parsed packet.
         """
-        if value is None:
-            return None
-            
-        # Convert to string first to handle PyShark objects
-        str_value = str(value)
-        
-        # Try to convert numeric strings
-        if str_value.isdigit():
-            return int(str_value)
-        
+        all_packets = []
+        logging.info(f"Starting packet capture from file: {file_path}")
+
         try:
-            # Try float conversion
-            if '.' in str_value and str_value.replace('.', '').replace('-', '').isdigit():
-                return float(str_value)
-        except ValueError:
-            pass
+            # FileCapture is a generator, making it memory-efficient for large files.
+            # `lazy_init=True` defers tshark startup until the first packet is accessed.
+            cap = pyshark.FileCapture(file_path, lazy_init=True)
             
-        # Handle boolean-like strings
-        if str_value.lower() in ('true', '1'):
-            return True
-        elif str_value.lower() in ('false', '0'):
-            return False
-            
-        return str_value
-    
-    def _extract_tcp_flags(self, packet: Any) -> Dict[str, bool]:
-        """Extract TCP flags if present."""
-        if not hasattr(packet, 'tcp'):
-            return {}
-            
-        tcp_flags = {}
-        flag_names = ['syn', 'ack', 'fin', 'rst', 'psh', 'urg', 'ece', 'cwr']
-        
-        for flag in flag_names:
-            flag_value = self._safe_get_attr(packet, f'tcp.flags.{flag}', 0)
-            tcp_flags[flag] = bool(self._convert_value(flag_value))
-            
-        return tcp_flags
-    
-    def _extract_protocol_specific(self, packet: Any) -> Dict[str, Any]:
-        """Extract protocol-specific fields for various protocols."""
-        protocol_data = {}
-        
-        # DNS fields
-        if hasattr(packet, 'dns'):
-            protocol_data['dns'] = {
-                'query_name': self._convert_value(self._safe_get_attr(packet, 'dns.qry.name')),
-                'query_type': self._convert_value(self._safe_get_attr(packet, 'dns.qry.type')),
-                'response_code': self._convert_value(self._safe_get_attr(packet, 'dns.flags.rcode')),
-                'is_response': bool(self._convert_value(self._safe_get_attr(packet, 'dns.flags.response', 0))),
-                'transaction_id': self._convert_value(self._safe_get_attr(packet, 'dns.id'))
-            }
-        
-        # HTTP fields
-        if hasattr(packet, 'http'):
-            protocol_data['http'] = {
-                'method': self._convert_value(self._safe_get_attr(packet, 'http.request.method')),
-                'uri': self._convert_value(self._safe_get_attr(packet, 'http.request.uri')),
-                'host': self._convert_value(self._safe_get_attr(packet, 'http.host')),
-                'status_code': self._convert_value(self._safe_get_attr(packet, 'http.response.code')),
-                'user_agent': self._convert_value(self._safe_get_attr(packet, 'http.user_agent')),
-                'content_type': self._convert_value(self._safe_get_attr(packet, 'http.content_type'))
-            }
-        
-        # HTTPS/TLS fields
-        if hasattr(packet, 'tls') or hasattr(packet, 'ssl'):
-            tls_layer = packet.tls if hasattr(packet, 'tls') else packet.ssl
-            protocol_data['tls'] = {
-                'version': self._convert_value(self._safe_get_attr(packet, 'tls.version')),
-                'cipher_suite': self._convert_value(self._safe_get_attr(packet, 'tls.handshake.ciphersuite')),
-                'server_name': self._convert_value(self._safe_get_attr(packet, 'tls.handshake.extensions_server_name')),
-                'record_type': self._convert_value(self._safe_get_attr(packet, 'tls.record.content_type'))
-            }
-        
-        # GTP fields (for mobile networks)
-        if hasattr(packet, 'gtp'):
-            protocol_data['gtp'] = {
-                'version': self._convert_value(self._safe_get_attr(packet, 'gtp.version')),
-                'message_type': self._convert_value(self._safe_get_attr(packet, 'gtp.message_type')),
-                'teid': self._convert_value(self._safe_get_attr(packet, 'gtp.teid')),
-                'sequence_number': self._convert_value(self._safe_get_attr(packet, 'gtp.seq'))
-            }
-        
-        # NGAP fields (5G protocol)
-        if hasattr(packet, 'ngap'):
-            protocol_data['ngap'] = {
-                'procedure_code': self._convert_value(self._safe_get_attr(packet, 'ngap.procedureCode')),
-                'criticality': self._convert_value(self._safe_get_attr(packet, 'ngap.criticality')),
-                'message_type': self._convert_value(self._safe_get_attr(packet, 'ngap.choice'))
-            }
-        
-        # ICMP fields
-        if hasattr(packet, 'icmp'):
-            protocol_data['icmp'] = {
-                'type': self._convert_value(self._safe_get_attr(packet, 'icmp.type')),
-                'code': self._convert_value(self._safe_get_attr(packet, 'icmp.code')),
-                'checksum': self._convert_value(self._safe_get_attr(packet, 'icmp.checksum'))
-            }
-        
-        return protocol_data
-    
-    def _extract_packet_data(self, packet: Any, packet_num: int) -> Dict[str, Any]:
-        """
-        Extract structured data from a single packet.
-        
-        Args:
-            packet: PyShark packet object
-            packet_num: Packet number for reference
-            
-        Returns:
-            Dictionary containing packet metadata
-        """
-        try:
-            # Basic packet information
-            packet_data = {
-                'packet_number': packet_num,
-                'timestamp': self._convert_value(packet.sniff_timestamp),
-                'length': self._convert_value(packet.length),
-                'captured_length': self._convert_value(packet.captured_length),
-                'protocols': [layer.layer_name for layer in packet.layers],
-                'highest_layer': packet.highest_layer if hasattr(packet, 'highest_layer') else None
-            }
-            
-            # IP layer information
-            if hasattr(packet, 'ip'):
-                packet_data.update({
-                    'src_ip': self._convert_value(packet.ip.src),
-                    'dst_ip': self._convert_value(packet.ip.dst),
-                    'ip_version': self._convert_value(packet.ip.version),
-                    'ttl': self._convert_value(packet.ip.ttl),
-                    'ip_protocol': self._convert_value(packet.ip.proto),
-                    'ip_flags': self._convert_value(self._safe_get_attr(packet, 'ip.flags')),
-                    'fragment_offset': self._convert_value(self._safe_get_attr(packet, 'ip.frag_offset'))
-                })
-            elif hasattr(packet, 'ipv6'):
-                packet_data.update({
-                    'src_ip': self._convert_value(packet.ipv6.src),
-                    'dst_ip': self._convert_value(packet.ipv6.dst),
-                    'ip_version': 6,
-                    'hop_limit': self._convert_value(packet.ipv6.hlim),
-                    'ip_protocol': self._convert_value(packet.ipv6.nxt),
-                    'flow_label': self._convert_value(self._safe_get_attr(packet, 'ipv6.flow'))
-                })
-            
-            # Transport layer information
-            if hasattr(packet, 'tcp'):
-                packet_data.update({
-                    'src_port': self._convert_value(packet.tcp.srcport),
-                    'dst_port': self._convert_value(packet.tcp.dstport),
-                    'transport_protocol': 'TCP',
-                    'tcp_seq': self._convert_value(packet.tcp.seq),
-                    'tcp_ack': self._convert_value(packet.tcp.ack),
-                    'tcp_window_size': self._convert_value(packet.tcp.window_size_value),
-                    'tcp_flags': self._extract_tcp_flags(packet),
-                    'tcp_stream': self._convert_value(self._safe_get_attr(packet, 'tcp.stream')),
-                    'tcp_retransmission': bool(self._safe_get_attr(packet, 'tcp.analysis.retransmission')),
-                    'tcp_duplicate_ack': bool(self._safe_get_attr(packet, 'tcp.analysis.duplicate_ack')),
-                    'tcp_fast_retransmission': bool(self._safe_get_attr(packet, 'tcp.analysis.fast_retransmission'))
-                })
-            elif hasattr(packet, 'udp'):
-                packet_data.update({
-                    'src_port': self._convert_value(packet.udp.srcport),
-                    'dst_port': self._convert_value(packet.udp.dstport),
-                    'transport_protocol': 'UDP',
-                    'udp_length': self._convert_value(packet.udp.length),
-                    'udp_checksum': self._convert_value(packet.udp.checksum),
-                    'udp_stream': self._convert_value(self._safe_get_attr(packet, 'udp.stream'))
-                })
-            
-            # Add protocol-specific data
-            protocol_specific = self._extract_protocol_specific(packet)
-            if protocol_specific:
-                packet_data['protocol_data'] = protocol_specific
-            
-            # Ethernet layer information
-            if hasattr(packet, 'eth'):
-                packet_data.update({
-                    'src_mac': self._convert_value(packet.eth.src),
-                    'dst_mac': self._convert_value(packet.eth.dst),
-                    'eth_type': self._convert_value(packet.eth.type)
-                })
-            
-            return packet_data
-            
-        except Exception as e:
-            logger.warning(f"Error parsing packet {packet_num}: {str(e)}")
-            return {
-                'packet_number': packet_num,
-                'error': str(e),
-                'timestamp': None,
-                'length': None,
-                'protocols': []
-            }
-    
-    def parse_pcap(self, file_path: str, display_filter: Optional[str] = None) -> List[Dict[str, Any]]:
-        """
-        Parse PCAP/PCAPNG file and extract structured packet data.
-        
-        Args:
-            file_path: Path to PCAP/PCAPNG file
-            display_filter: Optional Wireshark display filter
-            
-        Returns:
-            List of dictionaries containing packet metadata
-        """
-        packets_data = []
-        packet_count = 0
-        
-        try:
-            logger.info(f"Starting to parse PCAP file: {file_path}")
-            
-            # Create capture object with lazy loading
-            capture_kwargs = {'input_file': file_path, 'lazy': True}
-            if display_filter:
-                capture_kwargs['display_filter'] = display_filter
-                
-            capture = pyshark.FileCapture(**capture_kwargs)
-            
-            for packet in capture:
-                packet_count += 1
-                
-                # Extract packet data
-                packet_data = self._extract_packet_data(packet, packet_count)
-                packets_data.append(packet_data)
-                
-                # Progress logging
-                if packet_count % 1000 == 0:
-                    logger.info(f"Processed {packet_count} packets...")
-                
-                # Check max packets limit
-                if self.max_packets and packet_count >= self.max_packets:
-                    logger.info(f"Reached maximum packet limit: {self.max_packets}")
+            for i, packet in enumerate(cap):
+                if packet_limit and i >= packet_limit:
+                    logging.info(f"Reached packet limit of {packet_limit}. Stopping parse.")
                     break
+                
+                try:
+                    # 1. Start with the base, universal information
+                    packet_data = self._extract_base_info(i + 1, packet)
+                    
+                    # 2. Add transport layer details (TCP/UDP)
+                    self._extract_transport_layer_info(packet, packet_data)
+                    
+                    # 3. Add specific application layer details
+                    self._extract_application_layer_info(packet, packet_data)
+                    
+                    all_packets.append(packet_data)
+                
+                except Exception as e:
+                    # This catches unexpected errors during individual packet processing
+                    logging.warning(f"Could not parse packet #{i+1}. Error: {e}. Skipping.")
+                    continue
             
-            capture.close()
-            logger.info(f"Successfully parsed {packet_count} packets from {file_path}")
-            
-        except Exception as e:
-            logger.error(f"Error parsing PCAP file {file_path}: {str(e)}")
+            cap.close()
+
+        except pyshark.errors.TsharkNotFoundException:
+            logging.error("Tshark not found! Please install it and ensure it's in your system's PATH.")
             raise
-        
-        return packets_data
-    
-    def extract_flows(self, packets: List[Dict[str, Any]]) -> Dict[str, List[Dict[str, Any]]]:
+        except Exception as e:
+            logging.error(f"An error occurred during file capture: {e}")
+            raise
+
+        logging.info(f"Successfully parsed {len(all_packets)} packets from {file_path}.")
+        return all_packets
+
+    def extract_flows(self, packets: list) -> dict:
         """
-        Group packets into logical flows/conversations.
-        
+        Groups a list of parsed packets into logical flows (conversations).
+
+        A flow is defined by a canonical 5-tuple:
+        (protocol, smaller_ip, smaller_port, larger_ip, larger_port)
+
         Args:
-            packets: List of parsed packet dictionaries
-            
+            packets (list): A list of parsed packet dictionaries from `parse_pcap`.
+
         Returns:
-            Dictionary with flow identifiers as keys and packet lists as values
+            dict: A dictionary where keys are flow identifiers (tuples) and
+                  values are lists of packets belonging to that flow.
         """
         flows = defaultdict(list)
+        logging.info(f"Extracting flows from {len(packets)} packets.")
         
         for packet in packets:
-            # Skip packets with errors or missing IP info
-            if 'error' in packet or not packet.get('src_ip') or not packet.get('dst_ip'):
+            # A flow requires IP and Port information to be meaningful
+            if not all([packet.get('src_ip'), packet.get('dst_ip'), packet.get('src_port'), packet.get('dst_port')]):
                 continue
+
+            # Create a canonical flow key to group bidirectional traffic
+            # The key is always (proto, smaller_addr, larger_addr) where addr is (ip, port)
+            addr1 = (packet['src_ip'], packet['src_port'])
+            addr2 = (packet['dst_ip'], packet['dst_port'])
             
-            # Create flow identifier
-            src_ip = packet['src_ip']
-            dst_ip = packet['dst_ip']
-            protocol = packet.get('transport_protocol', 'UNKNOWN')
-            src_port = packet.get('src_port', 0)
-            dst_port = packet.get('dst_port', 0)
-            
-            # Normalize flow direction (smaller IP first for consistency)
-            if src_ip < dst_ip:
-                flow_id = f"{src_ip}:{src_port}-{dst_ip}:{dst_port}-{protocol}"
+            if addr1 < addr2:
+                flow_key = (packet['protocol'],) + addr1 + addr2
             else:
-                flow_id = f"{dst_ip}:{dst_port}-{src_ip}:{src_port}-{protocol}"
+                flow_key = (packet['protocol'],) + addr2 + addr1
             
-            # For TCP, also group by stream if available
-            if protocol == 'TCP' and 'tcp_stream' in packet:
-                flow_id = f"TCP_STREAM_{packet['tcp_stream']}"
-            elif protocol == 'UDP' and 'udp_stream' in packet:
-                flow_id = f"UDP_STREAM_{packet['udp_stream']}"
+            flows[flow_key].append(packet)
             
-            flows[flow_id].append(packet)
-        
-        # Convert to regular dict and sort packets in each flow by timestamp
-        result_flows = {}
-        for flow_id, flow_packets in flows.items():
-            # Sort by timestamp, handling None values
-            sorted_packets = sorted(
-                flow_packets,
-                key=lambda x: x.get('timestamp') or 0
-            )
-            result_flows[flow_id] = sorted_packets
-        
-        logger.info(f"Extracted {len(result_flows)} flows from {len(packets)} packets")
-        return result_flows
+        logging.info(f"Identified {len(flows)} unique flows.")
+        return dict(flows) # Convert back to a standard dict for consistency
 
 
-# Convenience functions for easy usage
-def parse_pcap(file_path: str, max_packets: Optional[int] = None, 
-               display_filter: Optional[str] = None) -> List[Dict[str, Any]]:
-    """
-    Convenience function to parse a PCAP file.
+# --- Example Usage ---
+if __name__ == '__main__':
+    # This block demonstrates how to use the PacketParser class.
+    # You would need a sample PCAP file. For this example, we'll assume
+    # a file named 'sample.pcap' exists in the same directory.
     
-    Args:
-        file_path: Path to PCAP/PCAPNG file
-        max_packets: Maximum number of packets to parse
-        display_filter: Optional Wireshark display filter
-        
-    Returns:
-        List of parsed packet dictionaries
-    """
-    parser = PacketParser(max_packets=max_packets)
-    return parser.parse_pcap(file_path, display_filter=display_filter)
-
-
-def extract_flows(packets: List[Dict[str, Any]]) -> Dict[str, List[Dict[str, Any]]]:
-    """
-    Convenience function to extract flows from parsed packets.
-    
-    Args:
-        packets: List of parsed packet dictionaries
-        
-    Returns:
-        Dictionary of flows
-    """
-    parser = PacketParser()
-    return parser.extract_flows(packets)
-
-
-# Example usage and testing
-if __name__ == "__main__":
-    # Example usage
+    # Create a dummy pcap file if you don't have one (requires scapy)
     try:
-        # Parse a PCAP file
-        packets = parse_pcap("example.pcap", max_packets=100)
+        from scapy.all import wrpcap, Ether, IP, TCP, DNS, DNSQR
         
-        # Extract flows
-        flows = extract_flows(packets)
+        dummy_packets = [
+            Ether()/IP(src="192.168.1.10", dst="8.8.8.8")/TCP(sport=12345, dport=53, flags="S"),
+            Ether()/IP(src="8.8.8.8", dst="192.168.1.10")/TCP(sport=53, dport=12345, flags="SA"),
+            Ether()/IP(src="192.168.1.10", dst="8.8.8.8")/TCP(sport=12345, dport=53, flags="A"),
+            Ether()/IP(src="192.168.1.10", dst="8.8.8.8")/TCP(dport=53)/DNS(rd=1, qd=DNSQR(qname="pyshark.com")),
+        ]
+        wrpcap("sample.pcap", dummy_packets)
+        PCAP_FILE_PATH = "sample.pcap"
         
-        # Print summary
-        print(f"Parsed {len(packets)} packets")
-        print(f"Identified {len(flows)} flows")
+    except ImportError:
+        print("Scapy not found. Cannot create a dummy pcap file.")
+        print("Please place a 'sample.pcap' file in this directory to run the example.")
+        PCAP_FILE_PATH = "sample.pcap" # This will likely fail if the file doesn't exist.
         
-        # Show first packet structure
-        if packets:
-            print("\nFirst packet structure:")
-            print(json.dumps(packets[0], indent=2, default=str))
-        
-    except FileNotFoundError:
-        print("Example PCAP file not found. Please provide a valid PCAP file path.")
     except Exception as e:
-        print(f"Error: {e}")
+        print(f"Error creating dummy pcap: {e}")
+        PCAP_FILE_PATH = "sample.pcap"
+        
+
+    parser = PacketParser()
+    
+    # 1. Parse the entire PCAP file
+    try:
+        parsed_packets = parser.parse_pcap(PCAP_FILE_PATH)
+        
+        # 2. Print the first 2 parsed packets to inspect the structure
+        print("\n--- Sample Parsed Packets (JSON) ---")
+        print(json.dumps(parsed_packets[:2], indent=2))
+
+        # 3. Extract and inspect flows from the parsed data
+        if parsed_packets:
+            packet_flows = parser.extract_flows(parsed_packets)
+            
+            print(f"\n--- Flow Extraction Summary ---")
+            print(f"Total flows found: {len(packet_flows)}")
+            
+            # Print details of the first flow found
+            if packet_flows:
+                first_flow_key = list(packet_flows.keys())[0]
+                first_flow_packets = packet_flows[first_flow_key]
+                print(f"\nDetails for flow: {first_flow_key}")
+                print(f"  Number of packets in this flow: {len(first_flow_packets)}")
+                print(f"  First packet timestamp: {first_flow_packets[0]['timestamp']}")
+                print(f"  Last packet timestamp: {first_flow_packets[-1]['timestamp']}")
+
+    except FileNotFoundError:
+        logging.error(f"ERROR: The file '{PCAP_FILE_PATH}' was not found. Please provide a valid PCAP file.")
+    except pyshark.errors.TsharkNotFoundException:
+        logging.error("CRITICAL: Tshark is required by PyShark but was not found.")
+        logging.error("Please install Tshark (part of the Wireshark suite) and ensure it is in your system's PATH.")
+    except Exception as e:
+        logging.error(f"An unexpected error occurred during the demonstration: {e}")
