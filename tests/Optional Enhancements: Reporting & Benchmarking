@@ -1,0 +1,12 @@
+Run all tests with a coverage report:
+Generated bash:
+pytest --cov=packetbuddy --cov-report=term-missing
+
+
+Bash
+Run performance benchmarks (on a function marked with @pytest.mark.benchmark):
+Generated python
+# In test_parser.py
+def test_performance_of_large_file(benchmark, large_pcap_file):
+    """PERF: Benchmark parsing of a large file."""
+    benchmark(parser.parse_pcap, large_pcap_file)
