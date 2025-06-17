@@ -1,0 +1,80 @@
+import joblib
+import json
+import logging
+from pathlib import Path
+from functools import lru_cache
+
+# Basic logging configuration
+logging.basicConfig(level=logging.INFO, format='[%(asctime)s] [%(levelname)s] [ModelRepo] %(message)s')
+
+# --- Keras/TF loading is optional; only import if needed to keep dependencies minimal ---
+try:
+    from tensorflow.keras.models import load_model as keras_load_model
+    KERAS_AVAILABLE = True
+except ImportError:
+    KERAS_AVAILABLE = False
+    
+class ModelRepository:
+    """A secure, offline loader for Packet Buddy's ML models."""
+
+    def __init__(self, model_base_path: str = "./models"):
+        self.base_path = Path(model_base_path)
+        if not self.base_path.is_dir():
+            logging.error(f"Model base path not found: {self.base_path}")
+            raise FileNotFoundError(f"Model base path not found: {self.base_path}")
+        logging.info("Model Repository initialized.")
+
+    @lru_cache(maxsize=16) # Cache up to 16 models in memory
+    def load_model(self, model_name: str) -> (object, dict):
+        """
+        Loads a model and its metadata from the repository.
+
+        Args:
+            model_name (str): The directory name of the model (e.g., 'dns_exfiltration_iforest').
+
+        Returns:
+            A tuple of (model_object, metadata_dict).
+        """
+        model_dir = self.base_path / model_name
+        if not model_dir.is_dir():
+            logging.error(f"Model '{model_name}' not found in repository.")
+            return None, None
+
+        # 1. Load Metadata and Validate
+        metadata_path = model_dir / "metadata.json"
+        try:
+            with open(metadata_path, 'r') as f:
+                metadata = json.load(f)
+            logging.info(f"Loaded metadata for '{model_name}' (Version: {metadata.get('version')})")
+        except Exception as e:
+            logging.error(f"Failed to load or parse metadata for '{model_name}': {e}")
+            return None, None
+            
+        # 2. Find and Load Model Artifact
+        model_artifact = None
+        for ext in ['.joblib', '.pkl', '.h5']:
+            potential_model_path = model_dir / f"model{ext}"
+            if potential_model_path.exists():
+                model_artifact = potential_model_path
+                break
+        
+        if not model_artifact:
+            logging.error(f"No valid model artifact (.joblib, .pkl, .h5) found for '{model_name}'.")
+            return None, metadata
+
+        # 3. Load based on extension (SECURITY: All offline)
+        try:
+            if model_artifact.suffix == '.h5':
+                if not KERAS_AVAILABLE:
+                    logging.error("Keras/TensorFlow not installed, cannot load .h5 model.")
+                    raise ImportError("Keras/TensorFlow is required for this model.")
+                model = keras_load_model(model_artifact)
+            elif model_artifact.suffix in ['.joblib', '.pkl']:
+                model = joblib.load(model_artifact)
+            
+            logging.info(f"Successfully loaded model artifact: {model_artifact.name}")
+            return model, metadata
+        
+        except Exception as e:
+            logging.critical(f"CRITICAL: Failed to load model file for '{model_name}': {e}")
+            return None, metadata
