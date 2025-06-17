@@ -1,0 +1,24 @@
+packetbuddy/
+├── main.py
+├── parser.py
+├── summarizer.py
+├── anomalies.py
+└── chatbot.py
+tests/
+├── __init__.py
+├── conftest.py          # Shared fixtures and configurations
+├── test_data/           # Curated PCAP files for testing
+│   ├── simple_http.pcap
+│   ├── dns_and_icmp.pcapng
+│   ├── empty.pcap
+│   ├── malformed_packet.pcap
+│   └── known_anomaly_ssh_bruteforce.pcap
+│
+├── unit/                  # Tests for individual modules in isolation
+│   ├── test_parser.py
+│   ├── test_summarizer.py
+│   ├── test_anomalies.py
+│   └── test_chatbot.py
+│
+└── integration/           # Tests for interactions between modules
+    └── test_main_api.py
