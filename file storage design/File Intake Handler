@@ -1,0 +1,86 @@
+# main.py - A simplified Packet Buddy backend using Flask
+
+import os
+import uuid
+import time
+from flask import Flask, request, jsonify, session
+from werkzeug.utils import secure_filename
+
+# --- Configuration ---
+# This is my location on the filesystem.
+UPLOADS_BASE_DIR = "/var/lib/packetbuddy/uploads"
+TMP_UPLOADS_DIR = os.path.join(UPLOADS_BASE_DIR, "tmp")
+ARCHIVE_UPLOADS_DIR = os.path.join(UPLOADS_BASE_DIR, "archive")
+
+# Define allowed file extensions
+ALLOWED_EXTENSIONS = {'pcap', 'pcapng'}
+
+app = Flask(__name__)
+# A secret key is needed for session management
+app.secret_key = 'a_very_secret_and_complex_key_for_sessions'
+
+# --- Helper Functions ---
+def allowed_file(filename):
+    """Checks if the file extension is allowed."""
+    return '.' in filename and \
+           filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
+
+# --- API Endpoint ---
+@app.route('/api/v1/upload', methods=['POST'])
+def upload_file():
+    """
+    Handles the file upload, sanitization, and storage into the tmp directory.
+    """
+    # 1. Ensure a file was part of the request
+    if 'capture_file' not in request.files:
+        return jsonify({"error": "No file part in the request"}), 400
+
+    file = request.files['capture_file']
+
+    # 2. Ensure a file was actually selected
+    if file.filename == '':
+        return jsonify({"error": "No file selected for upload"}), 400
+
+    # 3. Validate the file type
+    if not file or not allowed_file(file.filename):
+        return jsonify({"error": "Invalid file type. Only .pcap and .pcapng are allowed."}), 400
+
+    # 4. Get a unique session ID. In a real app, this would be part of a login system.
+    # Here, we'll create one if it doesn't exist.
+    if 'session_id' not in session:
+        session['session_id'] = str(uuid.uuid4())
+    session_id = session['session_id']
+
+    # 5. Sanitize the original filename to prevent security risks.
+    # This fulfills the "normalized original filename" rule.
+    sanitized_basename = secure_filename(file.filename)
+
+    # 6. Construct the secure, unique filename.
+    # This fulfills the "UUIDs or timestamp prefixes" rule.
+    timestamp = int(time.time())
+    unique_id = uuid.uuid4()
+    new_filename = f"{timestamp}_{unique_id}_{sanitized_basename}"
+
+    # 7. Create the session-specific target directory.
+    # This fulfills the "organize by user/session ID" rule.
+    session_dir = os.path.join(TMP_UPLOADS_DIR, session_id)
+    os.makedirs(session_dir, exist_ok=True) # `exist_ok=True` prevents errors if it's already there
+
+    # 8. Save the file to its final destination within me.
+    save_path = os.path.join(session_dir, new_filename)
+    try:
+        file.save(save_path)
+    except Exception as e:
+        # In a real app, you would log this error.
+        return jsonify({"error": f"Could not save file: {e}"}), 500
+
+    # 9. Return a success response with the path for the backend to use.
+    return jsonify({
+        "message": "File uploaded successfully for processing.",
+        "session_id": session_id,
+        "internal_path": save_path
+    }), 201
+
+if __name__ == '__main__':
+    # For demonstration only. Use a proper WSGI server like Gunicorn in production.
+    app.run(debug=True)
