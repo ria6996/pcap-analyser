@@ -1,0 +1,16 @@
+/models/
+├── dns_exfiltration_iforest/
+│   ├── model.joblib
+│   └── metadata.json
+│
+├── port_scan_ocsvm/
+│   ├── model.pkl
+│   └── metadata.json
+│
+├── encrypted_traffic_autoencoder/
+│   ├── model.h5
+│   └── metadata.json
+│
+└── traffic_flow_dbscan/
+    ├── model.joblib
+    └── metadata.json
