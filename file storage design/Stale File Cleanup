@@ -1,0 +1,20 @@
+#!/bin/bash
+
+# /usr/local/bin/packetbuddy_cleanup.sh
+
+# This script finds and deletes all files and empty directories
+# within the tmp upload directory that haven't been modified
+# in the last 24 hours (1440 minutes).
+
+TMP_DIR="/var/lib/packetbuddy/uploads/tmp"
+TTL_MINUTES=1440 # 24 hours
+
+echo "Running Packet Buddy cleanup for files older than ${TTL_MINUTES} minutes..."
+
+# Find and delete files older than the TTL
+find "${TMP_DIR}" -type f -mmin +${TTL_MINUTES} -delete
+
+# Find and delete any empty session directories that may be left over
+find "${TMP_DIR}" -mindepth 1 -type d -empty -delete
+
+echo "Cleanup complete."
