@@ -1,0 +1,49 @@
+#!/bin/bash
+
+# This script should be run with sudo privileges.
+
+# --- Configuration ---
+BASE_DIR="/var/lib/packetbuddy"
+UPLOADS_DIR="${BASE_DIR}/uploads"
+SERVICE_USER="pktbuddy_svc"
+SERVICE_GROUP="pktbuddy_svc"
+
+echo "=== Setting up Packet Buddy Intake Vault ==="
+
+# 1. Create the dedicated service user and group that will own me.
+# The `-r` flag creates a system user, `-s /sbin/nologin` prevents shell access.
+if ! getent group ${SERVICE_GROUP} >/dev/null; then
+    echo "Creating group '${SERVICE_GROUP}'..."
+    groupadd -r ${SERVICE_GROUP}
+else
+    echo "Group '${SERVICE_GROUP}' already exists."
+fi
+
+if ! id -u ${SERVICE_USER} >/dev/null 2>&1; then
+    echo "Creating user '${SERVICE_USER}'..."
+    useradd -r -g ${SERVICE_GROUP} -s /sbin/nologin -d ${BASE_DIR} ${SERVICE_USER}
+else
+    echo "User '${SERVICE_USER}' already exists."
+fi
+
+# 2. Create my hierarchical directory structure.
+echo "Creating directory structure at ${UPLOADS_DIR}..."
+mkdir -p "${UPLOADS_DIR}/tmp"
+mkdir -p "${UPLOADS_DIR}/archive"
+
+# 3. Apply strict ownership and permissions.
+# Only the service user should have access.
+echo "Applying ownership and permissions..."
+chown -R ${SERVICE_USER}:${SERVICE_GROUP} ${BASE_DIR}
+chmod -R 700 ${BASE_DIR} # (rwx------)
+
+# 4. Security Note on 'noexec'
+echo "--------------------------------------------------------"
+echo "SECURITY ADVISORY:"
+echo "For maximum security, my partition (${BASE_DIR}) should be mounted with 'noexec'."
+echo "Add an entry to /etc/fstab for the device where I am located, e.g.:"
+echo "/dev/sdXN  /var/lib/packetbuddy  ext4  defaults,noexec,nosuid,nodev  0  2"
+echo "Then remount with: sudo mount -o remount,noexec ${BASE_DIR}"
+echo "--------------------------------------------------------"
+
+echo "=== Intake Vault setup complete. ==="
