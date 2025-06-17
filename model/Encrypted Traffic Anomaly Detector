@@ -1,0 +1,22 @@
+File: /models/encrypted_traffic_autoencoder/model.h5
+Metadata:
+Generated json
+{
+  "model_type": "AutoEncoder (Keras/TensorFlow)",
+  "version": "2.0.0",
+  "timestamp": "2023-11-01T11:00:00Z",
+  "training_dataset_profile": {
+    "name": "tls_flow_features_q2_q3_2023",
+    "size": 250000,
+    "description": "Feature vectors from benign TLS/SSL flows (e.g., handshake timings, certificate data)."
+  },
+  "feature_inputs": [
+    "flow_duration_ms",
+    "client_hello_size",
+    "server_hello_size",
+    "certificate_lifespan",
+    "tls_version_1_2",
+    "tls_version_1_3"
+  ],
+  "interface": "predict(X) -> returns reconstruction error. Higher error indicates anomaly."
+}
