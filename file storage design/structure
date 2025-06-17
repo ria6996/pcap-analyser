@@ -1,0 +1,18 @@
+/var/lib/packetbuddy/uploads/
+├── tmp/
+│   │   # For temporary, session-based, non-persisted files.
+│   │
+│   └── [session_id]/
+│       │   # e.g., session_id = 9e2f5b0a-3b1f-4c8d-8e6a-0d1c5a7f8b9c
+│       │
+│       └── 1678886400_a1b2c3d4-e5f6-g7h8-i9j0-k1l2m3n4o5p6_sanitized_capture.pcapng
+│       └── 1678886405_f9e8d7c6-b5a4-c3d2-e1f0-g9h8i7j6k5l4_another_file.pcap
+│
+└── archive/
+    │   # For persisted files linked to a specific user account.
+    │
+    └── [user_id]/
+        │   # e.g., user_id = 1138
+        │
+        └── 2023-03-15T12_00_00Z_local_network_traffic.pcap
+        └── 2023-04-01T09_30_15Z_guest_wifi_analysis.pcapng
