@@ -1,0 +1,20 @@
+File:     /models/dns_exfiltration_iforest/model.joblib
+Metadata:
+Generated json
+{
+  "model_type": "IsolationForest",
+  "version": "1.2.0",
+  "timestamp": "2023-10-26T10:00:00Z",
+  "training_dataset_profile": {
+    "name": "internal_lab_dns_q3_2023",
+    "size": 150000,
+    "description": "Benign and simulated DNS tunneling traffic logs."
+  },
+  "feature_inputs": [
+    "query_length",
+    "entropy_query_name",
+    "num_subdomains",
+    "response_size"
+  ],
+  "interface": "predict(X) -> returns -1 for anomalies, 1 for inliers."
+}
