@@ -1,0 +1,19 @@
+File: /models/port_scan_ocsvm/model.pkl
+Metadata:
+Generated json
+{
+  "model_type": "OneClassSVM",
+  "version": "1.0.1",
+  "timestamp": "2023-09-15T14:30:00Z",
+  "training_dataset_profile": {
+    "name": "firewall_connection_logs_ benign_only_h1_2023",
+    "size": 5000000,
+    "description": "Connection logs from perimeter firewall during normal operation."
+  },
+  "feature_inputs": [
+    "unique_dest_ports_per_src_ip_60s",
+    "syn_packet_ratio_per_src_ip",
+    "connection_rate_per_src_ip"
+  ],
+  "interface": "predict(X) -> returns -1 for anomalies, 1 for inliers."
+}
