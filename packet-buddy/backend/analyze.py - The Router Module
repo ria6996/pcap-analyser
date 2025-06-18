@@ -1,0 +1,165 @@
+# analyze.py
+
+import logging
+import os
+import tempfile
+from collections import Counter
+
+import aiofiles
+import pyshark
+from fastapi import (APIRouter, File, HTTPException, UploadFile, status)
+
+# --- Configuration ---
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# Create an APIRouter instance
+router = APIRouter()
+
+# Define common protocols to identify "unusual" ones
+# This set can be expanded based on what is considered "normal" for your network.
+COMMON_PROTOCOLS = {
+    'TCP', 'UDP', 'ICMP', 'ICMPV6', 'ARP', 'DNS', 'HTTP', 'TLS', 'SSL', 
+    'SSDP', 'MDNS', 'DHCP', 'DHCPV6', 'NTP'
+}
+
+# --- Anomaly Detection Thresholds ---
+# A single source IP is anomalous if it accounts for more than this percentage of packets.
+SINGLE_IP_PACKET_THRESHOLD_PERCENT = 0.6
+# Minimum number of packets required to trigger the single IP anomaly detection.
+MIN_PACKETS_FOR_IP_ANOMALY = 50
+
+
+# --- Helper Functions & Models (can be in a separate file) ---
+
+def perform_analysis(pcap_path: str) -> dict:
+    """
+    Analyzes a PCAP file and extracts statistics and anomalies.
+
+    Args:
+        pcap_path: The file path to the temporary PCAP file.
+
+    Returns:
+        A dictionary containing the analysis results.
+    """
+    try:
+        # Use FileCapture to read from the saved file
+        cap = pyshark.FileCapture(pcap_path)
+    except Exception as e:
+        logger.error(f"Pyshark could not open or parse the file: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Failed to parse PCAP file. Ensure tshark is installed and the file is valid. Error: {e}"
+        )
+
+    packet_count = 0
+    protocol_counts = Counter()
+    source_ips = Counter()
+    destination_ips = Counter()
+
+    # pyshark's iterator is synchronous, so we process it here.
+    # For very large files, this could be moved to a background task.
+    for packet in cap:
+        packet_count += 1
+        
+        # 1. Tally protocols
+        try:
+            # highest_layer provides the most specific protocol (e.g., DNS, HTTP)
+            protocol = packet.highest_layer
+            protocol_counts[protocol] += 1
+        except AttributeError:
+            # Some packets might not have layers pyshark can identify
+            protocol_counts['UNKNOWN'] += 1
+
+        # 2. Tally IP addresses (IPv4 and IPv6)
+        if 'IP' in packet:
+            source_ips[packet.ip.src] += 1
+            destination_ips[packet.ip.dst] += 1
+        elif 'IPV6' in packet:
+            source_ips[packet.ipv6.src] += 1
+            destination_ips[packet.ipv6.dst] += 1
+            
+    cap.close()
+
+    # 3. Perform Anomaly Detection
+    anomalies = []
+
+    # Anomaly: Large number of packets from a single source IP
+    if packet_count > MIN_PACKETS_FOR_IP_ANOMALY and source_ips:
+        top_source, top_count = source_ips.most_common(1)[0]
+        if (top_count / packet_count) > SINGLE_IP_PACKET_THRESHOLD_PERCENT:
+            anomalies.append(
+                f"High Traffic Concentration: IP {top_source} sent {top_count} packets, "
+                f"accounting for {top_count / packet_count:.2%} of total traffic."
+            )
+
+    # Anomaly: Presence of unusual protocols
+    for protocol, count in protocol_counts.items():
+        if protocol.upper() not in COMMON_PROTOCOLS:
+            anomalies.append(
+                f"Unusual Protocol Detected: {protocol} appeared {count} times."
+            )
+
+    # 4. Get Top 5 IPs
+    top_5_sources = [{"ip": ip, "count": count} for ip, count in source_ips.most_common(5)]
+    top_5_destinations = [{"ip": ip, "count": count} for ip, count in destination_ips.most_common(5)]
+
+    return {
+        "packet_count": packet_count,
+        "protocol_counts": dict(protocol_counts),
+        "top_ips": {
+            "sources": top_5_sources,
+            "destinations": top_5_destinations
+        },
+        "anomalies": anomalies
+    }
+
+
+# --- API Endpoint ---
+
+@router.post("/analyze", summary="Analyze a PCAP file for network statistics")
+async def analyze_pcap_file(file: UploadFile = File(..., description="PCAP file to analyze.")):
+    """
+    Accepts a PCAP file, saves it temporarily, and analyzes it to extract:
+    - Total packet count
+    - Protocol distribution
+    - Top 5 source and destination IPs
+    - Basic anomalies like high traffic from a single source or unusual protocols.
+    """
+    # Create a temporary directory to securely store the file
+    with tempfile.TemporaryDirectory() as temp_dir:
+        temp_pcap_path = os.path.join(temp_dir, file.filename)
+        
+        logger.info(f"Receiving file: {file.filename}. Saving to {temp_pcap_path}")
+
+        try:
+            # Save the uploaded file asynchronously
+            async with aiofiles.open(temp_pcap_path, 'wb') as out_file:
+                while content := await file.read(1024 * 1024):  # Read in 1MB chunks
+                    await out_file.write(content)
+        except Exception as e:
+            logger.error(f"Failed to save uploaded file: {e}")
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="There was an error saving the uploaded file."
+            )
+
+        if not os.path.exists(temp_pcap_path) or os.path.getsize(temp_pcap_path) == 0:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Received an empty or invalid file."
+            )
+
+        logger.info("File saved. Starting analysis.")
+        
+        # The analysis function is synchronous, but we call it from our async endpoint.
+        # For CPU-bound tasks, you might use `run_in_executor`. For pyshark, this is okay.
+        analysis_results = perform_analysis(temp_pcap_path)
+        
+        logger.info("Analysis complete. Returning results.")
+        
+        return analysis_results
+
+# The `router` variable can now be imported and included in a main FastAPI application.
